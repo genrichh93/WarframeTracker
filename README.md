@@ -1,6 +1,6 @@
 # Warframe Mastery Dashboard
 
-![Dashboard Screenshot](./path/to/your/screenshot.png) <!-- Replace this with a link to a good screenshot of your app's dashboard -->
+![Dashboard Screenshot](./screenshots/dashboard.png) <!-- Replace this with a link to a good screenshot of your app's dashboard -->
 
 A comprehensive, local desktop application for tracking your Warframe mastery progress, live game events, and resource requirements. Built with Python and Tkinter for a native cross-platform experience.
 
