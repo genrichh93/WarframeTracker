@@ -20,12 +20,14 @@ This application fetches all necessary data from official and community-maintain
     -   Persistent column sorting that remains even after updating item statuses.
     -   Powerful search and filtering options (Hide Mastered, Hide Primes).
     -   Context-aware UI that adapts filters and detail views for different categories.
+![Mastery-Tracker](./screenshots/masterytracker.png)
 
 -   **🌐 Live Ticker:**
     -   Real-time status of Cetus, Orb Vallis, and the Cambion Drift.
     -   Current Sortie and Archon Hunt missions and modifiers.
     -   Active Nightwave challenges with reputation rewards.
     -   Void Trader (Baro Ki'Teer) inventory, location, and arrival/departure times.
+![Live-Ticker](./screenshots/liveticker.png)
 
 -   **🔍 Relic Finder:**
     -   Search all Void Relics and see their rewards with drop chances.
