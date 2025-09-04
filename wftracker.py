@@ -9,7 +9,7 @@ import sqlite3
 import tempfile
 import threading
 import webbrowser
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from io import BytesIO
 from urllib.parse import quote
 import requests
@@ -25,15 +25,27 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 import mplcursors  # pip install mplcursors
 from matplotlib.animation import FuncAnimation
 from PIL import Image, ImageTk
-
+from concurrent.futures import ThreadPoolExecutor
 
 # --- KONFIGURATION ---
 DB_FILE = "warframe_data.db"
-IMAGE_CACHE_DIR = "image_cache" # --- NEU: Ordner für den Bild-Cache
-CATEGORIES = ["Gesamtübersicht", "Warframe", "Primary", "Secondary", "Melee", "Amp", "Arch-Gun", "Arch-Melee", "Companion", "Vehicle", "Necramechs", "Star Chart"]
+IMAGE_CACHE_DIR = "image_cache"
+CACHE_DIR = "cache"  # NEU
+CACHE_DURATION_SECONDS = 86400  # NEU (24 Stunden in Sekunden)
+CATEGORIES = ["Gesamtübersicht", "Warframe", "Primary", "Secondary", "Melee", "Amp", 
+              "Arch-Gun", "Arch-Melee", "Companion", "Sentinel", "Sentinel Weapon", "Vehicle", 
+              "Necramechs", "Star Chart", "Resources"]
 STATUS_OPTIONS = ["Mastered", "Building", "Built", "Leveling", "Missing"]
 STATUS_COLORS = {'Mastered': '#a3e6a3', 'Building': '#e6d1a3', 'Built': '#a3d1e6', 'Leveling': '#cda3e6', 'Missing': '#e6a3a3'}
-MASTERY_POINTS = {"Warframe": 6000, "Companion": 6000, "Archwing": 6000, "Vehicle": 6000, "Primary": 3000, "Secondary": 3000, "Melee": 3000, "Amp": 3000, "Arch-Gun": 3000, "Arch-Melee": 3000, "Default": 3000}
+MASTERY_POINTS = {
+    "Warframe": 6000, 
+    "Companion": 6000,
+    "Sentinel": 3000,
+    "Sentinel Weapon": 3000,
+    "Archwing": 6000, "Vehicle": 6000, 
+    "Primary": 3000, "Secondary": 3000, "Melee": 3000, "Amp": 3000, 
+    "Arch-Gun": 3000, "Arch-Melee": 3000, "Default": 3000
+}
 API_BASE_URL = "https://raw.githubusercontent.com/WFCD/warframe-items/refs/heads/master/data/json"
 STATUS_TEXT_COLORS = {
     'Mastered': '#28a745',  # Ein kräftiges Grün
@@ -142,14 +154,159 @@ RESOURCE_TRACKER_EXCLUSION_EXCEPTIONS = {
     'gyromag systems', 'atmos systems', 'repeller systems'
 }
 
+MANUAL_ACQUISITION_DATA = {
+    # Der Schlüssel ist der kleingeschriebene Name der Ressource
+    # --- Plains of Eidolon ---
+    "auron": [{"place": "Plains of Eidolon (Red Mineral Veins)", "type": "Mining", "rotation": "-", "chance": "N/A"}],
+    "azurite": [{"place": "Plains of Eidolon (Blue Mineral Veins)", "type": "Mining", "rotation": "-", "chance": "N/A"}],
+    "breath of the eidolon": [{"place": "Plains of Eidolon (Bounties)", "type": "Bounty Reward", "rotation": "-", "chance": "Varies"}],
+    "cetus wisp": [{"place": "Plains of Eidolon (Near Water, Night)", "type": "World Drop", "rotation": "-", "chance": "N/A"}],
+    "condroc wing": [{"place": "Plains of Eidolon (Hunting Condrocs)", "type": "Hunting", "rotation": "-", "chance": "N/A"}],
+    "crimzian": [{"place": "Plains of Eidolon (Red Mineral Veins)", "type": "Mining", "rotation": "-", "chance": "N/A"}],
+    "devar": [{"place": "Plains of Eidolon (Blue Mineral Veins)", "type": "Mining", "rotation": "-", "chance": "N/A"}],
+    "eidolon shard": [{"place": "Plains of Eidolon (Killing Eidolons)", "type": "Boss Drop", "rotation": "-", "chance": "Guaranteed"}],
+    "grokdrul": [{"place": "Plains of Eidolon (Grineer Camps)", "type": "Container Drop", "rotation": "-", "chance": "N/A"}],
+    "iradite": [{"place": "Plains of Eidolon (Destroying Formations)", "type": "World Drop", "rotation": "-", "chance": "N/A"}],
+    "intact sentient core": [{"place": "Plains of Eidolon (Killing Vomvalysts)", "type": "Enemy Drop", "rotation": "-", "chance": "N/A"}],
+    "kuaka spinal claw": [{"place": "Plains of Eidolon (Hunting Kuakas)", "type": "Hunting", "rotation": "-", "chance": "N/A"}],
+    "mawfish bones": [{"place": "Plains of Eidolon (Fishing)", "type": "Fishing", "rotation": "-", "chance": "N/A"}],
+    "murkray liver": [{"place": "Plains of Eidolon (Coastal Fishing)", "type": "Fishing", "rotation": "-", "chance": "N/A"}],
+    "norg brain": [{"place": "Plains of Eidolon (Coastal Fishing, Night)", "type": "Fishing", "rotation": "-", "chance": "N/A"}],
+    "pyrol": [{"place": "Plains of Eidolon (Red Mineral Veins)", "type": "Mining", "rotation": "-", "chance": "N/A"}],
+    "sentirum": [{"place": "Plains of Eidolon (Red Mineral Veins, Night)", "type": "Mining", "rotation": "-", "chance": "N/A"}],
+    "sharrac teeth": [{"place": "Plains of Eidolon (Lake Fishing)", "type": "Fishing", "rotation": "-", "chance": "N/A"}],
+    "tralok eyes": [{"place": "Plains of Eidolon (Lake Fishing)", "type": "Fishing", "rotation": "-", "chance": "N/A"}],
+    "veridos": [{"place": "Plains of Eidolon (Blue Mineral Veins)", "type": "Mining", "rotation": "-", "chance": "N/A"}],
+
+    # --- Orb Vallis (Fortuna) ---
+    "amarast": [{"place": "Orb Vallis (Blue Mineral Veins)", "type": "Mining", "rotation": "-", "chance": "N/A"}],
+    "axidite": [{"place": "Orb Vallis (Red Mineral Veins)", "type": "Mining", "rotation": "-", "chance": "N/A"}],
+    "calda toroid": [{"place": "Enrichment Labs (Orb Vallis)", "type": "Enemy Drop", "rotation": "-", "chance": "Low"}],
+    "charc electroplax": [{"place": "Orb Vallis (Cave Fishing)", "type": "Fishing", "rotation": "-", "chance": "N/A"}],
+    "coprun": [{"place": "Orb Vallis (Blue Mineral Veins)", "type": "Mining", "rotation": "-", "chance": "N/A"}],
+    "crisma toroid": [{"place": "Profit-Taker Orb (Heist Bounties)", "type": "Boss Drop", "rotation": "-", "chance": "Guaranteed"}],
+    "goopolla spleen": [{"place": "Orb Vallis (Pond Fishing)", "type": "Fishing", "rotation": "-", "chance": "N/A"}],
+    "gyromag systems": [{"place": "Fortuna (Profit-Taker Bounties)", "type": "Bounty Reward", "rotation": "-", "chance": "Varies"}],
+    "hesperon": [{"place": "Orb Vallis (Red Mineral Veins)", "type": "Mining", "rotation": "-", "chance": "N/A"}],
+    "kriller thermal laser": [{"place": "Orb Vallis (Cave Fishing)", "type": "Fishing", "rotation": "-", "chance": "N/A"}],
+    "lazulite toroid": [{"place": "Exploiter Orb (Deck 12)", "type": "Boss Drop", "rotation": "-", "chance": "Guaranteed"}],
+    "longwinder lathe coagulant": [{"place": "Orb Vallis (Cave Fishing)", "type": "Fishing", "rotation": "-", "chance": "N/A"}],
+    "namalon": [{"place": "Orb Vallis (Blue Mineral Veins)", "type": "Mining", "rotation": "-", "chance": "N/A"}],
+    "repeller systems": [{"place": "Fortuna (Profit-Taker Bounties)", "type": "Bounty Reward", "rotation": "-", "chance": "Varies"}],
+    "sola toroid": [{"place": "Temple of Profit (Orb Vallis)", "type": "Enemy Drop", "rotation": "-", "chance": "Low"}],
+    "sapcaddy venedo case": [{"place": "Orb Vallis (Pond Fishing)", "type": "Fishing", "rotation": "-", "chance": "N/A"}],
+    "scrubber exa brain": [{"place": "Orb Vallis (Cave Fishing)", "type": "Fishing", "rotation": "-", "chance": "N/A"}],
+    "thermal sludge": [{"place": "Orb Vallis (Corpus Camps)", "type": "Container Drop", "rotation": "-", "chance": "N/A"}],
+    "tink dissipator coil": [{"place": "Orb Vallis (Pond Fishing)", "type": "Fishing", "rotation": "-", "chance": "N/A"}],
+    "tromyzon entroplasma": [{"place": "Orb Vallis (Pond Fishing)", "type": "Fishing", "rotation": "-", "chance": "N/A"}],
+    "vega toroid": [{"place": "Spaceport (Orb Vallis)", "type": "Enemy Drop", "rotation": "-", "chance": "Low"}],
+    "zodian": [{"place": "Orb Vallis (Red Mineral Veins)", "type": "Mining", "rotation": "-", "chance": "N/A"}],
+
+    # --- Cambion Drift (Deimos) ---
+    "adramalium": [{"place": "Cambion Drift (Yellow/Red Mineral Veins)", "type": "Mining", "rotation": "-", "chance": "N/A"}],
+    "ariette scale": [{"place": "Cambion Drift (Vome Fass Fishing)", "type": "Fishing", "rotation": "-", "chance": "N/A"}],
+    "bapholite": [{"place": "Cambion Drift (Yellow/Red Mineral Veins)", "type": "Mining", "rotation": "-", "chance": "N/A"}],
+    "bellow voca": [{"place": "Cambion Drift (Vome Residue)", "type": "World Drop", "rotation": "-", "chance": "N/A"}],
+    "benign infested tumor": [{"place": "Cambion Drift (Juggernaut)", "type": "Enemy Drop", "rotation": "-", "chance": "N/A"}],
+    "biotic filter": [{"place": "Cambion Drift (Filleting Aquapulmo, Duroid)", "type": "Fishing", "rotation": "-", "chance": "N/A"}],
+    "charamote sagan module": [{"place": "Cambion Drift (Fass Residue Fishing)", "type": "Fishing", "rotation": "-", "chance": "N/A"}],
+    "connla sprout": [{"place": "Cambion Drift (Fass Residue)", "type": "Harvesting", "rotation": "-", "chance": "N/A"}],
+    "cranial foremount": [{"place": "Cambion Drift (Fass Residue Fishing)", "type": "Fishing", "rotation": "-", "chance": "N/A"}],
+    "dagonic": [{"place": "Cambion Drift (Fass Residue Fishing)", "type": "Fishing", "rotation": "-", "chance": "N/A"}],
+    "dendrite blastoma": [{"place": "Cambion Drift (Yellow/Red Mineral Veins)", "type": "Mining", "rotation": "-", "chance": "N/A"}],
+    "dracroot": [{"place": "Cambion Drift (Vome Residue)", "type": "Harvesting", "rotation": "-", "chance": "N/A"}],
+    "echo voca": [{"place": "Cambion Drift (Fass Residue)", "type": "World Drop", "rotation": "-", "chance": "N/A"}],
+    "efervon sample": [{"place": "Cambion Drift (Conservation)", "type": "Conservation", "rotation": "-", "chance": "N/A"}],
+    "embolos": [{"place": "Cambion Drift (Mining)", "type": "Mining", "rotation": "-", "chance": "N/A"}],
+    "entrati lanthorn": [{"place": "Zariman Ten Zero / Deimos Bounties", "type": "Bounty Reward", "rotation": "-", "chance": "Varies"}],
+    "ferment bladder": [{"place": "Cambion Drift (Fass Residue Fishing)", "type": "Fishing", "rotation": "-", "chance": "N/A"}],
+    "ganglion": [{"place": "Cambion Drift (Infested Enemies)", "type": "Enemy Drop", "rotation": "-", "chance": "N/A"}],
+    "gorgaricus spore": [{"place": "Cambion Drift (Harvesting)", "type": "Harvesting", "rotation": "-", "chance": "N/A"}],
+    "heciphron": [{"place": "Cambion Drift (Yellow/Red Mineral Veins)", "type": "Mining", "rotation": "-", "chance": "N/A"}],
+    "lucent teroglobe": [{"place": "Cambion Drift (Infested Cysts)", "type": "World Drop", "rotation": "-", "chance": "N/A"}],
+    "mirewinder parallel biode": [{"place": "Cambion Drift (Vome Fass Fishing)", "type": "Fishing", "rotation": "-", "chance": "N/A"}],
+    "mortus horn": [{"place": "Cambion Drift (Conservation)", "type": "Conservation", "rotation": "-", "chance": "N/A"}],
+    "mytocardia spore": [{"place": "Cambion Drift (Infested Cysts)", "type": "World Drop", "rotation": "-", "chance": "N/A"}],
+    "necracoil": [{"place": "Cambion Drift (Mining)", "type": "Mining", "rotation": "-", "chance": "N/A"}],
+    "necracoil": [{"place": "Cambion Drift (Requiem Obelisks)", "type": "Mission Reward", "rotation": "-", "chance": "N/A"}],
+    "pustulent cognitive nodule": [{"place": "Cambion Drift (Conservation)", "type": "Conservation", "rotation": "-", "chance": "N/A"}],
+    "pustulite": [{"place": "Cambion Drift (Harvesting)", "type": "Harvesting", "rotation": "-", "chance": "N/A"}],
+    "rune marrow": [{"place": "Cambion Drift (Conservation)", "type": "Conservation", "rotation": "-", "chance": "N/A"}],
+    "saturated muscle mass": [{"place": "Cambion Drift (Conservation)", "type": "Conservation", "rotation": "-", "chance": "N/A"}],
+    "scintillant": [{"place": "Cambion Drift (Isolation Vault Bounties)", "type": "Bounty Reward", "rotation": "-", "chance": "Varies"}],
+    "seriglass shard": [{"place": "Necralisk (Rank 5 Entrati Reward)", "type": "Syndicate Reward", "rotation": "-", "chance": "N/A"}],
+    "shrill voca": [{"place": "Cambion Drift (Central Area, Both Fass/Vome)", "type": "World Drop", "rotation": "-", "chance": "N/A"}],
+    "son token": [{"place": "Necralisk (Conservation Tags)", "type": "Syndicate Turn-in", "rotation": "-", "chance": "N/A"}],
+    "spinal core section": [{"place": "Cambion Drift (Isolation Vault Bounties)", "type": "Bounty Reward", "rotation": "-", "chance": "Varies"}],
+    "sporulate sac": [{"place": "Cambion Drift (Juggernaut)", "type": "Enemy Drop", "rotation": "-", "chance": "N/A"}],
+    "synathid ecosynth analyzer": [{"place": "Cambion Drift (Vome Fass Fishing)", "type": "Fishing", "rotation": "-", "chance": "N/A"}],
+    "tasoma extract": [{"place": "Cambion Drift (Fass Residue)", "type": "Harvesting", "rotation": "-", "chance": "N/A"}],
+    "techrot chitin": [{"place": "Cambion Drift (Conservation)", "type": "Conservation", "rotation": "-", "chance": "N/A"}],
+    "techrot motherboard": [{"place": "Cambion Drift (Conservation)", "type": "Conservation", "rotation": "-", "chance": "N/A"}],
+    "thaumica": [{"place": "Cambion Drift (Yellow Mineral Veins)", "type": "Mining", "rotation": "-", "chance": "N/A"}],
+    "tiametrite": [{"place": "Cambion Drift (Mining)", "type": "Mining", "rotation": "-", "chance": "N/A"}],
+    "travoride": [{"place": "Cambion Drift (Yellow/Red Mineral Veins)", "type": "Mining", "rotation": "-", "chance": "N/A"}],
+    "vainthorn": [{"place": "Cambion Drift (Vome/Fass Residue)", "type": "Harvesting", "rotation": "-", "chance": "N/A"}],
+    "venerol": [{"place": "Cambion Drift (Mining)", "type": "Mining", "rotation": "-", "chance": "N/A"}],
+    "waxen sebum deposit": [{"place": "Cambion Drift (Conservation)", "type": "Conservation", "rotation": "-", "chance": "N/A"}],
+    "xenorhast": [{"place": "Cambion Drift (Mining)", "type": "Mining", "rotation": "-", "chance": "N/A"}],
+    "yao shrub": [{"place": "Cambion Drift (Harvesting)", "type": "Harvesting", "rotation": "-", "chance": "N/A"}],
+
+    # --- Zariman Ten Zero ---
+    "entrail vayn": [{"place": "Zariman Ten Zero (Fishing)", "type": "Fishing", "rotation": "-", "chance": "N/A"}],
+    "voidgel orb": [{"place": "Zariman Ten Zero (Void Angels)", "type": "Enemy Drop", "rotation": "-", "chance": "N/A"}],
+    "voidplume pinion": [{"place": "Zariman Ten Zero (Void Angels & Bounties)", "type": "Bounty/Enemy Drop", "rotation": "-", "chance": "Varies"}],
+    "voidplume quill": [{"place": "Zariman Ten Zero (World Drop)", "type": "World Drop", "rotation": "-", "chance": "N/A"}],
+    
+    # --- Necramech / Deimos Vaults ---
+    "damaged necramech casing": [{"place": "Cambion Drift (Defeating Necramechs)", "type": "Enemy Drop", "rotation": "-", "chance": "Varies"}],
+    "damaged necramech pod": [{"place": "Cambion Drift (Defeating Necramechs)", "type": "Enemy Drop", "rotation": "-", "chance": "Varies"}],
+    "damaged necramech weapon pod": [{"place": "Cambion Drift (Defeating Necramechs)", "type": "Enemy Drop", "rotation": "-", "chance": "Varies"}],
+    
+    # --- Railjack ---
+    "anomaly shard": [{"place": "Veil Proxima (Sentient Anomaly)", "type": "Mission Reward", "rotation": "-", "chance": "Guaranteed"}],
+    "asterite": [{"place": "Earth/Venus Proxima (Mining)", "type": "Mining", "rotation": "-", "chance": "N/A"}],
+    "bracoid": [{"place": "Saturn Proxima (Fishing)", "type": "Fishing", "rotation": "-", "chance": "N/A"}],
+    "isoplast": [{"place": "Railjack Missions (Grineer)", "type": "Enemy Drop", "rotation": "-", "chance": "N/A"}],
+    "kovnik": [{"place": "Veil Proxima (Fishing)", "type": "Fishing", "rotation": "-", "chance": "N/A"}],
+    "nullstones": [{"place": "Veil Proxima (Mining)", "type": "Mining", "rotation": "-", "chance": "N/A"}],
+    "ticorol": [{"place": "Earth/Venus Proxima (Mining)", "type": "Mining", "rotation": "-", "chance": "N/A"}],
+    
+    # --- Other / Special ---
+    "argon crystal": [{"place": "The Void (Enemies & Containers)", "type": "Resource Drop", "rotation": "-", "chance": "Varies (Decays!)"}],
+    "cryotic": [{"place": "Excavation Missions", "type": "Mission Reward", "rotation": "-", "chance": "Guaranteed"}],
+    "detonite ampule": [{"place": "Grineer Missions (Various)", "type": "Invasion/Alert Reward", "rotation": "-", "chance": "Varies"}],
+    "fieldron sample": [{"place": "Corpus Missions (Various)", "type": "Invasion/Alert Reward", "rotation": "-", "chance": "Varies"}],
+    "hexenon": [{"place": "Jupiter (Amalgam Enemies)", "type": "Enemy Drop", "rotation": "-", "chance": "Varies"}],
+    "kavat genetic code": [{"place": "Deimos (Scanning Feral Kavats)", "type": "Scanning", "rotation": "-", "chance": "25%"}],
+    "kubrowpeteggitem": [{"place": "Earth (Destroying Kubrow Dens)", "type": "Resource Drop", "rotation": "-", "chance": "Low"}],
+    "kuva": [{"place": "Kuva Siphon/Flood Missions", "type": "Mission Reward", "rotation": "-", "chance": "Guaranteed"}],
+    "lamentus": [{"place": "Duviri (Dax Enemies, Chests)", "type": "World Drop", "rotation": "-", "chance": "Varies"}],
+    "lua thrax plasm": [{"place": "Lua (Conjunction Survival)", "type": "Mission Reward", "rotation": "C", "chance": "Varies"}],
+    "narmer isoplast": [{"place": "Plains/Vallis (Narmer Bounties)", "type": "Bounty Reward", "rotation": "-", "chance": "Varies"}],
+    "nitain extract": [{"place": "Nightwave Offerings", "type": "Store Purchase", "rotation": "-", "chance": "N/A"}],
+    "orokin ducats": [{"place": "Any Relay (Trading Prime Parts)", "type": "Trading", "rotation": "-", "chance": "N/A"}],
+    "oxium": [{"place": "Corpus Missions (Oxium Ospreys)", "type": "Enemy Drop", "rotation": "-", "chance": "Guaranteed"}],
+    "pathos clamp": [{"place": "Duviri (Orowyrm Fight)", "type": "Boss Drop", "rotation": "-", "chance": "Guaranteed"}],
+    "saggen pearl": [{"place": "Duviri (Enigmas)", "type": "Puzzle Reward", "rotation": "-", "chance": "N/A"}],
+    "spectral debris": [{"place": "Railjack (Derelicts)", "type": "World Drop", "rotation": "-", "chance": "N/A"}],
+    "stela": [{"place": "Zariman Ten Zero / Duviri", "type": "World Drop", "rotation": "-", "chance": "N/A"}],
+    "tellurium": [{"place": "Archwing Missions (All Enemies)", "type": "Enemy Drop", "rotation": "-", "chance": "Very Low"}],
+    "thrax plasm": [{"place": "Lua (Conjunction Survival)", "type": "Enemy Drop", "rotation": "-", "chance": "Varies"}],
+    "ueymag": [{"place": "Duviri (Fishing)", "type": "Fishing", "rotation": "-", "chance": "N/A"}],
+}
+
+
 def pretty_mission_type(s: str) -> str:
     """Konvertiert 'MT_PVP' zu 'PVP' und macht es hübscher."""
     return s.replace("MT_", "").replace("_", " ").title() if s else "N/A"
 
+
 def pretty_modifier(s: str) -> str:
     """Entfernt 'MODIFIER_' und macht es hübscher."""
     return s.replace("MODIFIER_", "").replace("_", " ").title() if s else "N/A"
-    
+
+   
 def resolve_node_name(conn, node_key: str) -> str:
     """Sucht den Klartextnamen für einen Node-Key wie 'SolNode123' in der DB."""
     if not node_key: return "N/A"
@@ -161,6 +318,7 @@ def resolve_node_name(conn, node_key: str) -> str:
     except Exception:
         return node_key
 
+
 def get_planet_image_url(planet_name: str) -> str:
         special_cases = {
             "Kuva Fortress": "Kuva_Fortress",
@@ -171,70 +329,82 @@ def get_planet_image_url(planet_name: str) -> str:
         safe_name = safe_name.replace(" ", "_")  # Leerzeichen durch _
         return f"https://wiki.warframe.com/images/{safe_name}.png"
 
-# --- API DATENIMPORT (ERWEITERT) ---
 
 def determine_app_category(item):
     """
-    Bestimmt die korrekte App-Kategorie für ein Item, indem die zuverlässigsten
-    Schlüssel wie 'productCategory' und 'uniqueName' priorisiert werden.
+    Determines the correct app category for an item using the most reliable keys
+    like 'productCategory' and 'uniqueName'.
     """
     unique_name = item.get('uniqueName', '')
     api_category = item.get('category', '')
-    product_category = item.get('productCategory', '') # Der neue, wichtige Schlüssel
+    product_category = item.get('productCategory', '')
 
-    # --- Priorität 1: Eindeutige Erkennung via productCategory ---
-    # Dies ist der sicherste Weg, um Amps zu identifizieren.
+    # --- HIGHEST PRIORITY: Specific product categories ---
+    if product_category == "Sentinels":
+        return "Sentinel"
+    if product_category == "SentinelWeapons":
+        return "Sentinel Weapon"
     if product_category == "OperatorAmps":
         return "Amp"
 
-    # --- Priorität 2: Behandele den Sonderfall "Necramech getarnt als Warframe" ---
+    # --- SPECIAL CASES based on category and uniqueName ---
     if api_category == "Warframes":
         if "mech" in unique_name.lower():
             return "Necramechs"
         else:
             return "Warframe"
-            
-    # --- Priorität 3: Prüfe auf andere Fahrzeuge via uniqueName ---
     elif "/hoverboard/" in unique_name.lower():
         return "Vehicle"
         
-    # --- Priorität 4: Allgemeines Mapping für alle anderen, eindeutigen Kategorien ---
+    # --- GENERAL MAPPING for all other items ---
     else:
         mapping = {
             "Primary": "Primary", "Secondary": "Secondary", "Melee": "Melee",
             "Arch-Gun": "Arch-Gun", "Arch-Melee": "Arch-Melee", "Archwing": "Vehicle",
-            "Sentinels": "Companion", "Kubrows": "Companion", "Kavats": "Companion",
-            "Moas": "Companion", "Vulpaphyla": "Companion", "Predasites": "Companion",
+            "Kubrows": "Companion", "Kavats": "Companion", "Moas": "Companion",
+            "Vulpaphyla": "Companion", "Predasites": "Companion",
             "Hounds": "Companion", "Pets": "Companion",
             "K-Drives": "Vehicle",
             "Necramechs": "Necramechs"
-            # 'Amp' wird nicht mehr benötigt, da es oben bereits sicher behandelt wird.
         }
         return mapping.get(api_category, None)
 
 
-
-# --- NEU: Funktion für den Massen-Download ---
 def download_all_images(conn, status_callback):
+    """
+    Lädt alle Item-Bilder aus der Datenbank parallel mit bis zu 15 Threads herunter.
+    """
     cur = conn.cursor()
-    cur.execute("SELECT image_name FROM items WHERE image_name != ''")
+    cur.execute("SELECT image_name FROM items WHERE image_name != '' AND image_name IS NOT NULL")
     image_names = [row[0] for row in cur.fetchall()]
-    total = len(image_names)
+    total_images = len(image_names)
+    
+    if total_images == 0:
+        status_callback("No item images to download.")
+        return
 
-    for i, name in enumerate(image_names, start=1):
-        local_path = os.path.join(IMAGE_CACHE_DIR, name)
+    def _download_worker(image_name):
+        """Lädt ein einzelnes Bild mit Fallback-Logik herunter."""
+        local_path = os.path.join(IMAGE_CACHE_DIR, image_name)
         if os.path.exists(local_path):
-            continue
-        status_callback(f"Lade Bild {i}/{total}: {name}")
-        url = f"https://wiki.warframe.com/images/{name}"
-        if not download_image_if_missing(url, local_path):
-            # Best-effort fallback to CDN naming (if your item images sometimes live here)
-            cdn_url = f"https://cdn.warframestat.us/img/{name}"
+            return  # Bild ist bereits vorhanden, nichts zu tun
+
+        wiki_url = f"https://wiki.warframe.com/images/{image_name}"
+        if not download_image_if_missing(wiki_url, local_path):
+            cdn_url = f"https://cdn.warframestat.us/img/{image_name}"
             download_image_if_missing(cdn_url, local_path)
 
-    status_callback("Download aller Bilder abgeschlossen.")
+    status_callback(f"Downloading {total_images} item images using up to 15 threads...")
+
+    with ThreadPoolExecutor(max_workers=15) as executor:
+        executor.map(_download_worker, image_names)
+
+    status_callback("Download of all item images complete.")
 
 def download_planet_images(status_callback=None):
+    """
+    Lädt alle Planeten-Bilder parallel mit bis zu 15 Threads herunter.
+    """
     planets = [
         "Mercury","Venus","Earth","Lua","Mars","Phobos","Deimos",
         "Ceres","Jupiter","Europa","Saturn","Uranus","Neptune",
@@ -242,21 +412,24 @@ def download_planet_images(status_callback=None):
     ]
     special = {"Kuva Fortress":"Kuva_Fortress","Zariman Ten Zero":"Zariman_Ten_Zero","Junctions":"Junction"}
 
-    if status_callback: status_callback("Downloading planet images...")
-    total = len(planets)
-    for i, planet in enumerate(planets, start=1):
-        safe = special.get(planet, planet).replace(" ", "_")
-        url = f"https://wiki.warframe.com/images/{safe}.png"
-        local_path = os.path.join(IMAGE_CACHE_DIR, f"{safe}.png")
-        if os.path.exists(local_path):
-            continue
-        ok = download_image_if_missing(url, local_path)
-        if status_callback:
-            if ok: status_callback(f"[{i}/{total}] {planet} downloaded")
-            else:  status_callback(f"Failed to download {planet}")
-    if status_callback: status_callback("Planet image download complete.")
+    if status_callback:
+        status_callback(f"Downloading {len(planets)} planet images using up to 15 threads...")
 
-# Die Signatur wird geändert, um die 'app'-Instanz zu akzeptieren
+    def _download_planet_worker(planet_name):
+        """Worker-Funktion zum Herunterladen eines einzelnen Planeten-Bildes."""
+        safe_name = special.get(planet_name, planet_name).replace(" ", "_")
+        url = f"https://wiki.warframe.com/images/{safe_name}.png"
+        local_path = os.path.join(IMAGE_CACHE_DIR, f"{safe_name}.png")
+        
+        # Diese Funktion prüft bereits, ob die Datei existiert.
+        download_image_if_missing(url, local_path)
+
+    with ThreadPoolExecutor(max_workers=15) as executor:
+        executor.map(_download_planet_worker, planets)
+
+    if status_callback:
+        status_callback("Download of all planet images complete.")
+
 def populate_database_from_api(app, conn, status_callback):
     API_URL = "https://raw.githubusercontent.com/WFCD/warframe-items/refs/heads/master/data/json/All.json"
     status_callback("Downloading item data from API... (This may take a moment)")
@@ -264,18 +437,10 @@ def populate_database_from_api(app, conn, status_callback):
         response = requests.get(API_URL)
         response.raise_for_status()
         all_items = response.json()
-
-        # --- KORREKTUR: Fülle die Namens-Karte in der übergebenen App-Instanz ---
-        status_callback("Building complete item name map...")
-        # Leere die Karte zuerst, um sicherzustellen, dass sie sauber ist
-        app.full_item_name_map.clear() 
-        for item in all_items:
-            if 'uniqueName' in item and 'name' in item:
-                app.full_item_name_map[item['uniqueName']] = item['name']
-        
         status_callback("Download complete. Processing and saving to database...")
         
         cursor = conn.cursor()
+
         items_to_insert = []
         
         for item in all_items:
@@ -312,7 +477,8 @@ def populate_database_from_api(app, conn, status_callback):
         
     except Exception as e:
         status_callback(f"An unexpected error occurred during import: {e}")
-    
+ 
+ 
 def populate_nodes_from_api(conn, status_callback):
     NODE_URL = "https://raw.githubusercontent.com/WFCD/warframe-items/master/data/json/Node.json"
     JUNCTION_MASTERY = 1000
@@ -364,7 +530,7 @@ def populate_nodes_from_api(conn, status_callback):
     except Exception as e:
         status_callback(f"An unexpected error occurred during node import: {e}")
 
-# --- NEUE HILFSFUNKTION FÜR DEN RELIC FINDER ---
+
 def fetch_relic_data_from_official_source(status_callback):
     """
     Holt und verarbeitet Relikt-Daten. Kombiniert die offizielle Drop-Tabelle (für aktive Relikte)
@@ -372,14 +538,17 @@ def fetch_relic_data_from_official_source(status_callback):
     Vaulted-Status und eine saubere, duplikatfreie Liste zu garantieren.
     """
 
+
 def _norm_key(planet: str, node_name: str) -> str:
     """Bildet einen robusten Vergleichsschlüssel (planet::node), alles kleingeschrieben & alphanumerisch."""
     def n(s): 
         return re.sub(r'\W+', '', (s or '').lower())
     return f"{n(planet)}::{n(node_name)}"
 
+
 def _looks_like_junction(name: str) -> bool:
     return 'junction' in (name or '').lower()
+
 
 def populate_nodes_mastery_from_public_export(conn, status_callback):
     URL = "https://raw.githubusercontent.com/calamity-inc/warframe-public-export/senpai/ExportRegions_en.json"
@@ -439,7 +608,8 @@ def populate_nodes_mastery_from_public_export(conn, status_callback):
 
     status_callback(f"Mastery synced: {len(updates)} updated, {len(inserts)} inserted.")
 
-# --- UTILS (new) ---
+
+# --- UTILS ---
 ROTATION_RE = re.compile(r',\s*(Rot(?:ation)?\s+[A-D])\b', re.IGNORECASE)
 
 def run_bg(fn, *args, daemon=True, **kwargs):
@@ -448,11 +618,13 @@ def run_bg(fn, *args, daemon=True, **kwargs):
     t.start()
     return t
 
+
 def clear_tree(tree: ttk.Treeview):
     """Fast clear all rows from a treeview."""
     children = tree.get_children('')
     if children:
         tree.delete(*children)
+
 
 def set_text(text_widget: tk.Text, value: str):
     """Safely set full text in a disabled Text widget."""
@@ -461,12 +633,43 @@ def set_text(text_widget: tk.Text, value: str):
     text_widget.insert(tk.END, value)
     text_widget.config(state=tk.DISABLED)
 
+
 def safe_get_json(url: str, headers=None, timeout=30):
+    """HTTP GET -> JSON with consistent headers, errors handled, and local caching."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    
+    # Erstellt einen sicheren Dateinamen aus der URL
+    filename = re.sub(r'[^a-zA-Z0-9_.-]', '_', url.split('/')[-1])
+    local_path = os.path.join(CACHE_DIR, filename)
+    
+    # Prüft, ob eine aktuelle Cache-Datei existiert
+    if os.path.exists(local_path):
+        is_cache_valid = (time.time() - os.path.getmtime(local_path)) < CACHE_DURATION_SECONDS
+        if is_cache_valid:
+            try:
+                with open(local_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError):
+                # Wenn die Cache-Datei korrupt ist, ignorieren wir sie
+                pass
+
+    # Wenn kein gültiger Cache vorhanden ist, aus dem Netzwerk herunterladen
+    headers = headers or {'User-Agent': 'WarframeMasteryTrackerApp/1.0'}
+    resp = requests.get(url, headers=headers, timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Die neuen Daten im Cache speichern
+    with open(local_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2) # indent=2 für bessere Lesbarkeit der Cache-Dateien
+        
+    return data
     """HTTP GET -> JSON with consistent headers and errors handled upstream."""
     headers = headers or {'User-Agent': 'WarframeMasteryTrackerApp/1.0'}
     resp = requests.get(url, headers=headers, timeout=timeout)
     resp.raise_for_status()
     return resp.json()
+
 
 def download_image_if_missing(url: str, local_path: str, headers=None, timeout=30):
     """Download image if local file missing; return True if (now) exists."""
@@ -482,6 +685,41 @@ def download_image_if_missing(url: str, local_path: str, headers=None, timeout=3
         return True
     except requests.RequestException:
         return False
+
+
+def build_full_name_map(app, status_callback):
+    """
+    Baut eine umfassende Übersetzungstabelle (uniqueName -> Name) aus mehreren API-Quellen.
+    """
+    status_callback("Building full item name cache...")
+    name_map = {
+        '/Lotus/Types/Items/MiscItems/Credits': "Credits" # Credits manuell hinzufügen
+    }
+    
+    # Liste der JSON-Dateien, die Namen enthalten könnten
+    urls_to_check = [
+        "https://raw.githubusercontent.com/WFCD/warframe-items/refs/heads/master/data/json/All.json",
+        "https://raw.githubusercontent.com/WFCD/warframe-items/refs/heads/master/data/json/Resources.json"
+    ]
+    
+    try:
+        for url in urls_to_check:
+            data = safe_get_json(url) # Verwendet Ihre sichere JSON-Abruffunktion
+            for item in data:
+                if 'uniqueName' in item and 'name' in item:
+                    # Füge den Namen zur Karte hinzu. Doppelte Einträge werden überschrieben, was ok ist.
+                    name_map[item['uniqueName']] = item['name']
+        
+        # Speichere die fertige Karte in der App-Instanz
+        app.full_item_name_map = name_map
+        status_callback("Item name cache built successfully.")
+    except Exception as e:
+        status_callback(f"Error building name cache: {e}")
+
+
+# -------------------
+# |     CLASSES
+# -------------------
 
 
 class ChartImage(ttk.Frame):
@@ -602,64 +840,73 @@ class ChartMPL(ttk.Frame):
 
         y = list(range(len(cats)))
         
-        # Use explicit colors for the bars
-        mastered_bars = self.ax.barh(y, [0]*len(cats), color=mastered_color, label="Mastered XP")
-        remaining_bars = self.ax.barh(y, [0]*len(cats), left=[0]*len(cats), color=remaining_color, label="Remaining XP")
-
-        # --- Style Axes, Ticks, and Spines ---
+        # Diese Teile sind alle korrekt und bleiben unverändert
+        mastered_bars_container = self.ax.barh(y, [0]*len(cats), color=mastered_color, label="Mastered XP")
+        remaining_bars_container = self.ax.barh(y, [0]*len(cats), left=[0]*len(cats), color=remaining_color, label="Remaining XP")
+        
         self.ax.set_yticks(y, labels=cats)
         self.ax.invert_yaxis()
-        self.ax.tick_params(axis='y', colors=text_color, length=0) # No tick lines on y-axis
+        self.ax.tick_params(axis='y', colors=text_color, length=0)
         self.ax.tick_params(axis='x', colors=text_color)
-        
-        # Hide top and right borders for a cleaner look
         self.ax.spines['top'].set_visible(False)
         self.ax.spines['right'].set_visible(False)
         self.ax.spines['left'].set_color(grid_color)
         self.ax.spines['bottom'].set_color(grid_color)
-
-        # --- Style Figure and Background ---
         self.fig.patch.set_facecolor(bg_color)
         self.ax.set_facecolor(bg_color)
-
-        # --- Add a subtle grid ---
         self.ax.xaxis.grid(True, linestyle='--', alpha=0.6, color=grid_color)
-        self.ax.set_axisbelow(True) # Ensure grid is behind the bars
-
-        # --- Style the Legend ---
+        self.ax.set_axisbelow(True)
         legend = self.ax.legend(loc="lower right")
         legend.get_frame().set_facecolor(bg_color)
         legend.get_frame().set_edgecolor(grid_color)
         for text in legend.get_texts():
             text.set_color(text_color)
-
         max_x = max((m+r) for m, r in zip(mastered, remaining)) or 1
         self.ax.set_xlim(0, max_x * 1.05)
 
-        # --- IMPROVED Hover Tooltips ---
+        # --- KORREKTUR BEGINNT HIER ---
+        # Wir ersetzen die Logik für den Tooltip komplett.
         if self._cursor:
             self._cursor.remove()
-        all_rects = list(mastered_bars) + list(remaining_bars)
+        
+        # Wir übergeben dem Cursor alle Balken-Objekte
+        all_rects = list(mastered_bars_container) + list(remaining_bars_container)
         self._cursor = mplcursors.cursor(all_rects, hover=True)
         
         @self._cursor.connect("add")
-        def _(sel):
-            rect = sel.artist
-            width = rect.get_width()
+        def on_hover(sel):
+            # sel.artist ist der konkrete Balken, über den wir hovern
+            bar = sel.artist
             
-            is_mastered = (rect in mastered_bars)
-            lbl = "Mastered XP" if is_mastered else "Remaining XP"
-            bar_color = mastered_color if is_mastered else remaining_color
-
-            sel.annotation.set_text(f"{lbl}: {int(width):,}")
+            # 1. Finde heraus, ob es ein 'Mastered'- oder 'Remaining'-Balken ist
+            is_mastered = (bar in mastered_bars_container)
             
-            # Style the annotation box like we did for the pie chart
+            # 2. Finde den Index des Balkens, um die Kategorie zu identifizieren
+            #    (z.B. Warframe -> 0, Primary -> 1, etc.)
+            if is_mastered:
+                data_index = mastered_bars_container.index(bar)
+                lbl = "Mastered XP"
+                # 3. Hole den KORREKTEN Wert aus der Original-Datenliste!
+                correct_value = mastered[data_index]
+                bar_color = mastered_color
+            else:
+                data_index = remaining_bars_container.index(bar)
+                lbl = "Remaining XP"
+                # 3. Hole den KORREKTEN Wert aus der Original-Datenliste!
+                correct_value = remaining[data_index]
+                bar_color = remaining_color
+            
+            # 4. Setze den Tooltip-Text mit dem korrekten, ursprünglichen Wert
+            sel.annotation.set_text(f"{lbl}: {int(correct_value):,}")
+            
+            # Der Rest ist nur Styling und bleibt wie zuvor
             sel.annotation.get_bbox_patch().set(facecolor=bar_color, alpha=0.95)
             sel.annotation.arrow_patch.set(arrowstyle="->", facecolor=text_color, ec="none")
             sel.annotation.set_color("white" if theme_dark else "black")
 
+        # --- KORREKTUR ENDET HIER ---
 
-        # --- Animation (Unchanged) ---
+        # Die Animation bleibt unverändert
         steps = 30
         def interp(step, target):
             return [t * step/steps for t in target]
@@ -668,13 +915,13 @@ class ChartMPL(ttk.Frame):
             cur_mastered = interp(frame, mastered)
             cur_remaining = interp(frame, remaining)
             for i, w in enumerate(cur_mastered):
-                mastered_bars[i].set_width(w)
+                mastered_bars_container[i].set_width(w)
             for i, w in enumerate(cur_remaining):
-                remaining_bars[i].set_x(cur_mastered[i])
-                remaining_bars[i].set_width(w)
-            return (*mastered_bars, *remaining_bars)
+                remaining_bars_container[i].set_x(cur_mastered[i])
+                remaining_bars_container[i].set_width(w)
+            return (*mastered_bars_container, *remaining_bars_container)
 
-        self.fig.tight_layout() # Adjust layout to prevent labels from being cut off
+        self.fig.tight_layout()
         self._anim = FuncAnimation(self.fig, update, frames=steps, interval=16, blit=False, repeat=False)
         self.canvas.draw_idle()
 
@@ -703,18 +950,21 @@ class DetailPanel(ttk.Frame):
         self.notebook.grid(row=1, column=0, sticky="nsew")
 
         # --- Tab 1: Overview ---
-        overview_tab = ttk.Frame(self.notebook, padding="5")
-        overview_tab.columnconfigure(0, weight=1)
+        self.overview_tab = ttk.Frame(self.notebook, padding="5")
+        self.overview_tab.columnconfigure(0, weight=1)
 
-        self.image_label = ttk.Label(overview_tab)
+        # --- HIER WAR DER FEHLER ---
+        # Wir müssen self.overview_tab als Parent verwenden
+        self.image_label = ttk.Label(self.overview_tab)
         self.image_label.grid(row=0, column=0, pady=10)
 
         self.description_text = tk.Text(
-            overview_tab, wrap=tk.WORD, height=8
+            self.overview_tab, wrap=tk.WORD, height=8
         )
+        # --- BIS HIER ---
         self.description_text.grid(row=1, column=0, sticky="nsew")
 
-        self.notebook.add(overview_tab, text="Overview")
+        self.notebook.add(self.overview_tab, text="Overview")
 
         # --- Tab 2: Crafting & Locations ---
         self.crafting_tab = ttk.Frame(self.notebook, padding="5")
@@ -831,45 +1081,109 @@ class DetailPanel(ttk.Frame):
                 self.notebook.add(self.crafting_tab, text="Crafting & Locations")
         except Exception:
             pass
+    
+    def hide_overview_tab(self):
+        """Versteckt den 'Overview'-Tab aus dem Notebook."""
+        try:
+            for tab_id in self.notebook.tabs():
+                if self.nametowidget(tab_id) is self.overview_tab:
+                    self.notebook.forget(tab_id)
+                    break
+        except Exception:
+            pass
+
+    def show_overview_tab(self):
+        """Zeigt den 'Overview'-Tab wieder an, falls er versteckt ist."""
+        try:
+            existing_tabs = [self.nametowidget(t) for t in self.notebook.tabs()]
+            if self.overview_tab not in existing_tabs:
+                self.notebook.insert(0, self.overview_tab, text="Overview") # Fügt ihn an erster Stelle ein
+        except Exception:
+            pass
+
+    def set_view_for_resource(self, is_resource_view: bool):
+        """Konfiguriert das Panel für die Item-Ansicht oder die Ressourcen-Ansicht."""
+        if is_resource_view:
+            # Ansicht für Ressourcen: Verstecke Overview und Komponenten
+            self.hide_overview_tab()
+            self.components_frame.grid_forget()
+            self.show_crafting_tab() # Stelle sicher, dass der Fundort-Tab da ist
+            if len(self.notebook.tabs()) > 0:
+                self.notebook.select(0) # Wähle den einzig verbliebenen Tab aus
+        else:
+            # Standard-Ansicht für Items: Zeige alles wieder an
+            self.show_overview_tab()
+            self.components_frame.grid(row=0, column=0, sticky="ew")
+            self.show_crafting_tab()
+            self.notebook.select(0) # Wähle standardmäßig den Overview-Tab aus
+
 
     # -------------------------------
     # Updating panel
     # -------------------------------
 
     def update_with_item(self, data):
-        # --- Star Chart node selected ---
-        if isinstance(data, (list, tuple)):
-            # (This part is already correct and remains unchanged)
-            planet_name, node_name, status = data
-            self.name_label.config(text=f"{node_name} ({planet_name})")
-            # ... etc.
-            return
+        """
+        Haupt-Dispatcher zur Aktualisierung des Detail-Panels.
+        Leitet die Daten an die entsprechende Helper-Methode weiter.
+        """
+        # Setzt das Panel immer zuerst auf die Standard-Item-Ansicht zurück.
+        # Das stellt sicher, dass alle UI-Elemente korrekt sichtbar sind, bevor
+        # eine neue Auswahl getroffen wird.
+        self.set_view_for_resource(False)
 
-        # --- Normal item selected ---
+        # Prüft, ob es sich um Daten von der Sternenkarte handelt (übergeben als Tupel/Liste)
+        if isinstance(data, (list, tuple)):
+            self._display_star_chart_node(data)
+        # Andernfalls muss es ein Item sein (übergeben als String)
+        else:
+            self._display_item_details(str(data))
+
+    def _display_star_chart_node(self, node_data):
+        """Helper zur Konfiguration des Panels für einen Sternenkarten-Knoten."""
+        # --- KORRIGIERTE LOGIK ZUR TAB-VERWALTUNG ---
+        # 1. Stelle sicher, dass der Overview-Tab, den wir anzeigen wollen, existiert.
+        self.show_overview_tab()
+        # 2. Verstecke den Crafting-Tab, den wir nicht wollen.
+        self.hide_crafting_tab()
+        # --- ENDE DER KORREKTUR ---
+
+        planet_name, node_name, status = node_data
+        self.name_label.config(text=f"{node_name} ({planet_name})")
         
-        # --- KORREKTUR TEIL 1: Name bereinigen und korrekt verwenden ---
-        display_name = str(data)              # Originalname für die Anzeige, z.B. "Lex *"
-        clean_name = display_name.strip(" *") # Bereinigter Name für Datenabfragen, z.B. "Lex"
+        safe_planet_name = planet_name.replace(' ', '_')
+        self.load_image(f"{safe_planet_name}.png")
+        
+        description = PLANET_DATA.get(planet_name, "No description available for this location.")
+        set_text(self.description_text, description)
+        
+        clear_tree(self.components_tree)
+        clear_tree(self.drops_tree)
+        self.components_tree.insert('', tk.END, values=("Not applicable", ""))
+        self.drops_tree.insert('', tk.END, values=("Not applicable for Star Chart nodes.", "", "", ""))
+        
+        # Wähle den Tab über seine Referenz aus, was immer sicher ist.
+        self.notebook.select(self.overview_tab)
+
+    def _display_item_details(self, item_name):
+        """Helper zur Konfiguration des Panels für ein Standard-Item."""
+        clean_name = item_name.strip(" *")
         
         cursor = self.app.conn.cursor()
-        # Verwende den bereinigten Namen für die Datenbankabfrage
         cursor.execute("SELECT description, image_name, components FROM items WHERE name = ?", (clean_name,))
         result = cursor.fetchone()
         
-        if not result: 
+        if not result:
             self.clear_panel()
             return
             
         description, image_name, components_json = result
         
-        # Verwende den Originalnamen für die Anzeige im Titel
-        self.name_label.config(text=display_name)
-        
+        self.name_label.config(text=item_name)
         set_text(self.description_text, description)
         
-        # Der Rest der Funktion (Komponenten laden, etc.) funktioniert jetzt,
-        # weil die DB-Abfrage erfolgreich war.
         self.show_crafting_tab()
+        
         clear_tree(self.components_tree)
         components = json.loads(components_json or "[]")
         for comp in components:
@@ -881,7 +1195,6 @@ class DetailPanel(ttk.Frame):
         self.load_image(image_name)
         self.notebook.select(0)
         self.clear_filters()
-
 
     def _setup_components_context_menu(self):
         self.components_context_menu = tk.Menu(self, tearoff=0)
@@ -957,17 +1270,53 @@ class DetailPanel(ttk.Frame):
         self.clear_filters()
         clear_tree(self.drops_tree)
         self.drops_tree.insert('', tk.END, values=(f"Searching for '{search_term}'...", "", "", ""))
-        self.notebook.select(1)
+        
+        self.show_crafting_tab()
+        self.notebook.select(self.crafting_tab)
 
-        def _fetch_drops():
+        def _fetch_and_combine_drops():
+            final_drops = []
+            mission_places_added = set()
+            search_key = search_term.lower()
+
+            # --- NEU: SCHRITT 1 - Manuelle Datenquelle zuerst prüfen ---
+            if search_key in MANUAL_ACQUISITION_DATA:
+                final_drops.extend(MANUAL_ACQUISITION_DATA[search_key])
+
+            # --- SCHRITT 2 - Missionsdaten (wie bisher) ---
+            mission_rewards = self.app.mission_drop_data.get(search_key, [])
+            for reward in mission_rewards:
+                norm_place = reward['place'].split('(')[0].strip().lower()
+                mission_places_added.add(norm_place)
+                final_drops.append({
+                    "place": reward['place'],
+                    "type": "Mission Reward",
+                    "rotation": reward['rotation'],
+                    "chance": reward['chance']
+                })
+
+            # --- SCHRITT 3 - API für Gegner-Drops (wie bisher) ---
             try:
                 url = f"https://api.warframestat.us/drops/search/{search_term.replace(' ', '%20')}"
-                self.current_drops = safe_get_json(url)
-                self.app.root.after(0, self._apply_drop_filters)
+                api_drops = safe_get_json(url)
+                for drop in api_drops:
+                    place = drop.get('place', '')
+                    norm_place = place.split('(')[0].strip().lower()
+                    
+                    if norm_place not in mission_places_added:
+                        final_drops.append({
+                            "place": place,
+                            "type": self._get_drop_type(place),
+                            "rotation": "N/A",
+                            "chance": drop.get('chance', 0)
+                        })
             except Exception:
-                self.app.root.after(0, lambda: self._populate_drops_tree([]))
+                pass
 
-        run_bg(_fetch_drops)
+            self.current_drops = final_drops
+            self.app.root.after(0, self._apply_drop_filters)
+
+        run_bg(_fetch_and_combine_drops)
 
 
     def _apply_drop_filters(self, *args):
@@ -1008,55 +1357,63 @@ class DetailPanel(ttk.Frame):
 
 
     def _get_drop_type(self, place_string):
-        place_lower = place_string.lower()
-        
-        # --- FINALE LOGIK: Priorisierte Erkennung aller Drop-Typen ---
-        
-        # 1. Relikte sind immer eindeutig.
-        if "relic" in place_lower: 
-            return "Relic"
+            place_lower = place_string.lower()
+            
+            # --- KORRIGIERTE LOGIK: Geänderte Reihenfolge und präzisere Schlüsselwörter ---
+            
+            # 1. Relikte und Bounties sind am eindeutigsten.
+            if "relic" in place_lower: 
+                return "Relic"
+            if "bounty" in place_lower:
+                return "Bounty"
+                
+            # 2. PRÜFUNG AUF MISSION REWARD ZUERST! Das ist die wichtigste Änderung.
+            #    Wenn eine Rotation, ein Tier oder eine Stufe erwähnt wird, ist es eine Missionsbelohnung.
+            if "rotation" in place_lower or "rot " in place_lower or "tier " in place_lower or "stage " in place_lower: 
+                return "Mission Reward"
+                
+            # 3. Erst DANACH auf "caches" prüfen. Dies fängt jetzt nur noch die Fälle ab,
+            #    die KEINE Rotationsbelohnungen sind (z.B. zufällige Container in der Welt).
+            if "caches" in place_lower:
+                return "Container Drop"
+                
+            # 4. Fallback: Wenn nichts anderes zutrifft, ist es ein Enemy Drop.
+            return "Enemy Drop"
 
-        # 2. NEU: Wenn "bounty" im Ort steht, ist es eine Kopfgeld-Belohnung.
-        if "bounty" in place_lower:
-            return "Bounty"
-            
-        # 3. Wenn "caches" erwähnt wird, ist es ein Container Drop.
-        if "caches" in place_lower:
-            return "Container Drop"
-            
-        # 4. Bisherige Prüfung für klassische Mission Rewards (Rotationen, Tiers, etc.)
-        if "rotation" in place_lower or "rot " in place_lower or "tier " in place_lower: 
-            return "Mission Reward"
-            
-        # 5. Fallback: Wenn nichts anderes zutrifft, ist es ein Enemy Drop.
-        return "Enemy Drop"
 
     def _populate_drops_tree(self, drop_data):
         clear_tree(self.drops_tree)
         if not drop_data:
-            self.drops_tree.insert('', tk.END, values=("No results for filter.", "", "", ""))
+            self.drops_tree.insert('', tk.END, values=("No results found.", "", "", ""))
             return
 
-        added = 0
         for drop in drop_data:
-            place = drop.get('place', '')
-            if any(tag in place for tag in ("(Exceptional)", "(Flawless)", "(Radiant)")):
-                continue
+            display_location = drop.get('place', 'N/A')
+            drop_type = drop.get('type', 'N/A')
+            rotation_text = drop.get('rotation', '-')
+            
+            # Bereinigen Sie den Ort, falls er von der alten API stammt
+            if drop_type != "Mission Reward":
+                 m = re.search(r'(?:Rotation|Rot|Tier|Stage)\s+([A-E1-5])', str(display_location), re.IGNORECASE)
+                 if m:
+                     display_location = display_location.split(m.group(0))[0].strip().rstrip(',')
+            
+            # --- HIER IST DIE FINALE KORREKTUR ---
+            chance_value = drop.get('chance')
+            chance_percent = "N/A" # Setze einen sicheren Standardwert
+            
+            try:
+                # Versuche, den Wert in eine Zahl umzuwandeln und zu formatieren
+                chance_percent = f"{float(chance_value):.2f}%"
+            except (ValueError, TypeError):
+                # Wenn es fehlschlägt (weil es 'N/A', None, etc. ist),
+                # behalte den ursprünglichen Wert (oder den Standard "N/A"), falls er nützlich ist.
+                if chance_value:
+                    chance_percent = str(chance_value)
+            # --- ENDE DER KORREKTUR ---
 
-            display_location = place.replace(" (Intact)", "")
-            rotation_text = "-"
-            m = ROTATION_RE.search(display_location)
-            if m:
-                rotation_text = m.group(1)
-                display_location = display_location[:m.start()].strip()
-
-            drop_type = self._get_drop_type(place)
-            chance_percent = f"{float(drop.get('chance', 0)):.2f}%"
             self.drops_tree.insert('', tk.END, values=(display_location, drop_type, rotation_text, chance_percent))
-            added += 1
 
-        if added == 0:
-            self.drops_tree.insert('', tk.END, values=("No Intact relics found.", "", "", ""))
 
     def load_image(self, image_name):
         if not image_name:
@@ -1155,19 +1512,20 @@ class DetailPanel(ttk.Frame):
         self.app.relic_finder_tab.search_and_select_relic(relic_name)
 
 
- # DASHBOARD 
+# DASHBOARD 
 class DashboardTab(ttk.Frame):
     def __init__(self, parent, app):
         super().__init__(parent, padding="10")
         self.app = app
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(1, weight=1)
+        self.rowconfigure(2, weight=1) # Charts are now in row 2
 
         # --- Top frame for Mastery and controls ---
         top_frame = ttk.Frame(self)
         top_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
 
-        # --- Mastery Rank Display ---
+        # --- THIS CODE WAS MISSING ---
+        # --- Mastery Rank Display (inside top_frame) ---
         mastery_frame = ttk.LabelFrame(top_frame, text="Mastery Rank", padding="15")
         mastery_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
         mastery_frame.columnconfigure(0, weight=1)
@@ -1178,30 +1536,88 @@ class DashboardTab(ttk.Frame):
         self.xp_label = ttk.Label(mastery_frame, text="XP: 0 / 2,500", anchor="center")
         self.xp_label.grid(row=2, column=0, sticky="ew")
 
-        # --- Controls Frame ---
+        # --- Controls Frame (inside top_frame) ---
         controls_frame = ttk.LabelFrame(top_frame, text="Controls", padding="15")
         controls_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(5, 0))
         self.refresh_button = ttk.Button(controls_frame, text="Refresh Charts", command=self.update_charts)
         self.refresh_button.pack(expand=True, fill=tk.BOTH)
+        # --- END OF MISSING CODE ---
 
-        # --- Chart area using a PanedWindow ---
+        # --- NEW: Frame for Intrinsics ---
+        intrinsics_frame = ttk.LabelFrame(self, text="Intrinsics", padding="10")
+        intrinsics_frame.grid(row=1, column=0, sticky="ew", pady=5)
+        intrinsics_frame.columnconfigure((0, 1), weight=1)
+
+        RAILJACK_INTRINSICS = ["Piloting", "Gunnery", "Tactical", "Engineering", "Command"]
+        DRIFTER_INTRINSICS = ["Combat", "Riding", "Opportunity", "Endurance", "Zenith"]
+        
+        self.intrinsic_vars = {}
+
+        railjack_frame = ttk.LabelFrame(intrinsics_frame, text="Railjack", padding=5)
+        railjack_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        for i, name in enumerate(RAILJACK_INTRINSICS):
+            key = f"railjack_{name.lower()}"
+            var = tk.IntVar(value=0)
+            self.intrinsic_vars[key] = var
+            ttk.Label(railjack_frame, text=name).grid(row=i, column=0, sticky="w", pady=2)
+            ttk.Spinbox(railjack_frame, from_=0, to=10, textvariable=var, width=5).grid(row=i, column=1, sticky="e", padx=5)
+
+        drifter_frame = ttk.LabelFrame(intrinsics_frame, text="Drifter", padding=5)
+        drifter_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+        for i, name in enumerate(DRIFTER_INTRINSICS):
+            key = f"drifter_{name.lower()}"
+            var = tk.IntVar(value=0)
+            self.intrinsic_vars[key] = var
+            ttk.Label(drifter_frame, text=name).grid(row=i, column=0, sticky="w", pady=2)
+            ttk.Spinbox(drifter_frame, from_=0, to=10, textvariable=var, width=5).grid(row=i, column=1, sticky="e", padx=5)
+
+        ttk.Button(intrinsics_frame, text="Save Intrinsics & Recalculate MR", command=self.save_intrinsics).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+
+        # --- Chart area (now in row 2) ---
         chart_pane = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
-        chart_pane.grid(row=1, column=0, sticky="nsew")
+        chart_pane.grid(row=2, column=0, sticky="nsew")
 
-        # Pie Chart
         pie_frame = ttk.LabelFrame(chart_pane, text="Overall Item Status", padding=5)
-        self.pie_chart_view = ChartMPL(pie_frame, with_toolbar=False) # <-- ADD THIS
+        self.pie_chart_view = ChartMPL(pie_frame, with_toolbar=False)
         self.pie_chart_view.pack(fill=tk.BOTH, expand=True)
         chart_pane.add(pie_frame, weight=1)
 
-        # Bar Chart
         bar_frame = ttk.LabelFrame(chart_pane, text="Mastery Progress by Category", padding=5)
-        self.bar_chart_view = ChartMPL(bar_frame, with_toolbar=False) # <-- AND ADD THIS
+        self.bar_chart_view = ChartMPL(bar_frame, with_toolbar=False)
         self.bar_chart_view.pack(fill=tk.BOTH, expand=True)
         chart_pane.add(bar_frame, weight=2)
+        
+        self.load_intrinsics()
 
-    def get_plotly_theme(self):
-        return "plotly_dark" if sv_ttk.get_theme() == "dark" else "plotly_white"
+    def load_intrinsics(self):
+        """Loads saved intrinsics values from the DB and updates the UI."""
+        try:
+            cursor = self.app.conn.cursor()
+            cursor.execute("SELECT key, value FROM user_progress")
+            for key, value in cursor.fetchall():
+                if key in self.intrinsic_vars:
+                    self.intrinsic_vars[key].set(value)
+        except Exception as e:
+            self.app.update_status_bar(f"Error loading intrinsics: {e}")
+
+    def save_intrinsics(self):
+        """Saves the current values from the Spinboxes to the database."""
+        try:
+            cursor = self.app.conn.cursor()
+            updates = []
+            for key, var in self.intrinsic_vars.items():
+                updates.append((var.get(), key))
+            
+            cursor.executemany("UPDATE user_progress SET value = ? WHERE key = ?", updates)
+            self.app.conn.commit()
+            
+            self.app.update_status_bar("Intrinsics saved. Recalculating Mastery Rank...")
+            
+            # Update the MR display immediately
+            self.update_mastery_rank()
+            
+        except Exception as e:
+            self.app.update_status_bar(f"Error saving intrinsics: {e}")
 
     def update_display(self):
         self.update_mastery_rank()
@@ -1210,19 +1626,20 @@ class DashboardTab(ttk.Frame):
     def update_mastery_rank(self):
             total_xp = self.app.calculate_total_xp() or 0
 
-            # Korrekte und robuste Logik zur MR-Berechnung
             mr = int(math.sqrt(total_xp / 2500)) if total_xp < 2250000 else 30 + int((total_xp - 2250000) / 147500)
             xp_for_current_mr = (2500 * mr**2) if mr <= 30 else (2250000 + (mr - 30) * 147500)
             xp_for_next_mr = (2500 * (mr + 1)**2) if mr < 30 else (xp_for_current_mr + 147500)
             
-            # Diese Zeilen verhindern negative Werte und Division durch Null
             xp_in_current_rank = max(0, total_xp - xp_for_current_mr)
             xp_needed_for_next_rank = max(1, xp_for_next_mr - xp_for_current_mr)
 
+            xp_remaining = xp_needed_for_next_rank - xp_in_current_rank
+
             self.mr_label.config(text=f"Mastery Rank {mr}")
-            # Verbessertes Label, das sowohl Gesamt-XP als auch den Fortschritt anzeigt
-            self.xp_label.config(text=f"Total XP: {int(total_xp):,}   |   Rank Progress: {int(xp_in_current_rank):,} / {int(xp_needed_for_next_rank):,}")
+
+            self.xp_label.config(text=f"Total XP: {int(total_xp):,}   |   Rank Progress: {int(xp_in_current_rank):,} / {int(xp_needed_for_next_rank):,}   |   Remaining: {int(xp_remaining):,}")
             
+            # Update the progress bar
             self.xp_progress['maximum'] = xp_needed_for_next_rank
             self.xp_progress['value'] = xp_in_current_rank
 
@@ -1231,56 +1648,47 @@ class DashboardTab(ttk.Frame):
     def update_charts(self):
         self.refresh_button.config(state="disabled")
         self.app.update_status_bar("Generating dashboard charts...")
-
-        # MAIN THREAD: safe to query Tk/SV-TTK here
         theme_dark = (sv_ttk.get_theme() == "dark")
-
-        # Start worker with only plain data (no Tk calls inside)
         threading.Thread(target=self._worker_collect_chart_data, args=(theme_dark,), daemon=True).start()
 
     def _worker_collect_chart_data(self, theme_dark: bool):
-            # compute DB aggregates only; NO Tk calls here
+            # Der Teil für das Kuchendiagramm bleibt unverändert
             status_counts = self.app.get_status_counts("Gesamtübersicht") or {}
             labels, sizes = [], []
             for key in STATUS_OPTIONS:
                 v = status_counts.get(key, 0) or 0
                 if v > 0:
-                    labels.append(key); sizes.append(v)
+                    labels.append(key)
+                    sizes.append(v)
 
-            # Die Kategorienliste wird nun dynamisch erstellt
-            categories = [c for c in CATEGORIES if c not in ["Gesamtübersicht"]]
+            # Daten für das Balkendiagramm sammeln (Ihre bereits korrigierte Version)
+            categories_for_bar_chart = [c for c in CATEGORIES if c != "Gesamtübersicht"]
             cats, mastered_vals, remaining_vals = [], [], []
             cursor = self.app.conn.cursor()
-            
-            for cat in categories:
-                total = 0
-                mastered = 0
-                
+
+            for cat in categories_for_bar_chart:
+                total_xp_for_category = 0
+                mastered_xp_for_category = 0
+
                 if cat == "Star Chart":
-                    # --- LOGIK FÜR STAR CHART ---
-                    # "Mastered" XP ist die Summe aus Normal + Steel Path
                     cursor.execute("SELECT SUM(mastery_points) FROM nodes WHERE status >= 1")
                     normal_xp = cursor.fetchone()[0] or 0
                     cursor.execute("SELECT SUM(steel_path_mastery_points) FROM nodes WHERE status >= 2")
                     steel_path_xp = cursor.fetchone()[0] or 0
-                    mastered = normal_xp + steel_path_xp
-
-                    # "Total" XP ist die Summe aller möglichen Punkte
+                    mastered_xp_for_category = normal_xp + steel_path_xp
                     cursor.execute("SELECT COALESCE(SUM(mastery_points),0) + COALESCE(SUM(steel_path_mastery_points),0) FROM nodes")
-                    total = cursor.fetchone()[0] or 0
+                    total_xp_for_category = cursor.fetchone()[0] or 0
                 else:
-                    # --- LOGIK FÜR ITEMS (wie bisher) ---
                     cursor.execute("SELECT SUM(mastery_points) FROM items WHERE category = ?", (cat,))
-                    total = cursor.fetchone()[0] or 0
+                    total_xp_for_category = cursor.fetchone()[0] or 0
                     cursor.execute("SELECT SUM(mastery_points) FROM items WHERE category = ? AND status = 'Mastered'", (cat,))
-                    mastered = cursor.fetchone()[0] or 0
+                    mastered_xp_for_category = cursor.fetchone()[0] or 0
 
-                if total > 0:
+                if total_xp_for_category > 0:
                     cats.append(cat)
-                    mastered_vals.append(mastered)
-                    remaining_vals.append(max(0, total - mastered))
-
-            # hop back to UI thread to render
+                    mastered_vals.append(mastered_xp_for_category)
+                    remaining_vals.append(max(0, total_xp_for_category - mastered_xp_for_category))
+            
             self.app.root.after(
                 0,
                 self._finalize_chart_update,
@@ -1294,18 +1702,16 @@ class DashboardTab(ttk.Frame):
             self.pie_chart_view.clear()
             self.pie_chart_view.ax.text(0.5, 0.5, "No status data.", ha="center", va="center")
             self.pie_chart_view.canvas.draw_idle()
-
         if cats and (any(mastered) or any(remaining)):
             self.bar_chart_view.draw_bar_animated(cats, mastered, remaining, theme_dark)
         else:
             self.bar_chart_view.clear()
             self.bar_chart_view.ax.text(0.5, 0.5, "No progress data.", ha="center", va="center")
             self.bar_chart_view.canvas.draw_idle()
-
         self.refresh_button.config(state="normal")
         self.app.update_status_bar("Dashboard updated.")
 
-
+# DASHBOARD CHART
 class ChartWebView(ttk.Frame):
     def __init__(self, parent, **kwargs):
         super().__init__(parent, **kwargs)
@@ -1392,21 +1798,32 @@ class MasteryTrackerTab(ttk.Frame):
     # -------------------------------
     def handle_category_click(self, category):
         self.current_category = category
+        self.sort_column = "name"
 
-        if category == "Star Chart":
-            # Hide Crafting tab + irrelevant checkboxes
+
+        # --- Logik für Checkboxes & Detail Panel Tabs (bleibt unverändert) ---
+        if category in ("Star Chart", "Resources"):
             self.detail_panel.hide_crafting_tab()
             self.hide_mastered_checkbutton.pack_forget()
             self.hide_primes_checkbutton.pack_forget()
         else:
-            # Show Crafting tab + filters
             self.detail_panel.show_crafting_tab()
             self.hide_mastered_checkbutton.pack(side=tk.LEFT, padx=5)
             self.hide_primes_checkbutton.pack(side=tk.LEFT, padx=5)
 
+        # --- NEUE, SAUBERE LOGIK FÜR DEN PROGRESS-FRAME ---
+        if category == "Resources":
+            # Verstecke den Frame, wenn "Resources" ausgewählt ist
+            self.summary_frame.grid_forget()
+        else:
+            # Zeige den Frame für ALLE anderen Kategorien wieder an
+            self.summary_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        
+        # --- Bestehende Aufrufe zur Aktualisierung der Anzeige ---
         self.display_items(self.current_category)
         self.update_summary_display()
         self.detail_panel.clear_panel()
+
 
     # -------------------------------
     # Treeview helpers
@@ -1438,16 +1855,34 @@ class MasteryTrackerTab(ttk.Frame):
         return "break"
 
     def _treeview_sort_column(self, tree, col, reverse):
+        # 1. Speichere den neuen Sortierzustand (das war bereits korrekt)
         self.sort_column = col
         self.sort_reverse = reverse
+
+        # 2. Führe die eigentliche Sortierung durch (war auch korrekt)
         l = [(tree.set(k, col), k) for k in tree.get_children("")]
         try:
+            # Versuche eine numerische Sortierung
             l.sort(key=lambda t: int(str(t[0]).replace(",", "")), reverse=reverse)
         except ValueError:
+            # Wenn das fehlschlägt, sortiere alphabetisch
             l.sort(key=lambda t: str(t[0]).lower(), reverse=reverse)
+
+        # 3. Ordne die Elemente in der Treeview neu an
         for index, (val, k) in enumerate(l):
             tree.move(k, "", index)
-        tree.heading(col, command=lambda: self._treeview_sort_column(tree, col, not reverse))
+
+        # --- 4. HIER IST DIE KORREKTUR: Aktualisiere ALLE Spalten-Header ---
+        # Gehe durch jede Spalte, die aktuell in der Tabelle existiert.
+        for c in tree["columns"]:
+            # Wenn es die Spalte ist, nach der wir gerade sortiert haben:
+            if c == col:
+                # Binde den Befehl so, dass der NÄCHSTE Klick die Richtung umkehrt.
+                tree.heading(c, command=lambda _c=c: self._treeview_sort_column(tree, _c, not reverse))
+            else:
+                # Für alle ANDEREN Spalten: Binde den Befehl so, dass der NÄCHSTE
+                # Klick eine neue, aufsteigende Sortierung startet.
+                tree.heading(c, command=lambda _c=c: self._treeview_sort_column(tree, _c, False))
 
     
     # -------------------------------
@@ -1457,91 +1892,136 @@ class MasteryTrackerTab(ttk.Frame):
         self.display_items(self.current_category)
 
     def display_items(self, category):
-        clear_tree(self.tree)
-        self.detail_panel.clear_panel()
-        cursor = self.app.conn.cursor()
-        
-        if category == "Star Chart":
-            cols = ('system', 'name', 'status')
-            self.tree.config(columns=cols)
-            for col in cols:
-                self.tree.heading(col, text=col.title(),
-                                  command=lambda _col=col: self._treeview_sort_column(self.tree, _col, False))
-            self.tree.column('system', width=100, anchor=tk.W)
-            self.tree.column('name', width=200, anchor=tk.W)
-            self.tree.column('status', width=100, anchor=tk.CENTER)
+            clear_tree(self.tree)
+            self.detail_panel.clear_panel()
+            cursor = self.app.conn.cursor()
             
-            base_query = "SELECT systemName, name, status FROM nodes"
-            params = []
-            search_term = self.search_var.get()
-            if search_term:
-                base_query += " WHERE systemName LIKE ? OR name LIKE ?"
-                params.extend([f"%{search_term}%", f"%{search_term}%"])
-            
-            base_query += " ORDER BY systemName, name"
-            cursor.execute(base_query, params)
-            
-            for system, name, status_int in cursor.fetchall():
-                status_text = NODE_STATUS_TEXT.get(status_int, "Unknown")
-                self.tree.insert('', tk.END, values=(system, name, status_text), tags=(status_text,))
-        else:
-            cols = ('name', 'mr', 'status')
-            self.tree.config(columns=cols)
-            for col in cols:
-                self.tree.heading(col, text=col.title(), command=lambda _col=col: self._treeview_sort_column(self.tree, _col, False))
-            self.tree.column('name', width=250)
-            self.tree.column('mr', width=50, anchor=tk.CENTER)
-            self.tree.column('status', width=100, anchor=tk.CENTER)
-            
-            # --- KORREKTUR: Füge uniqueName zur Abfrage hinzu ---
-            base_query = "SELECT name, mastery_rank, status, uniqueName FROM items"
-            where_clauses, params = [], []
-            if category not in ("Gesamtübersicht", "All Items"):
-                 where_clauses.append("category = ?")
-                 params.append(category)
-            search_term = self.search_var.get()
-            if search_term:
-                where_clauses.append("name LIKE ?")
-                params.append(f"%{search_term}%")
-            if self.hide_mastered_var.get():
-                where_clauses.append("status != 'Mastered'")
-            if self.hide_primes_var.get():
-                where_clauses.append("name NOT LIKE '% Prime'")
-            query = base_query
-            if where_clauses:
-                query += " WHERE " + " AND ".join(where_clauses)
-            query += " ORDER BY name"
-            cursor.execute(query, params)
-            
-            # --- KORREKTUR: Prüfe jedes Item und füge ggf. ein '*' hinzu ---
-            for row in cursor.fetchall():
-                name, mr, status, unique_name = row
+            # --- BLOCK 1: Logik für die Sternenkarte ---
+            if category == "Star Chart":
+                cols = ('system', 'name', 'status')
+                self.tree.config(columns=cols)
+                for col in cols:
+                    self.tree.heading(col, text=col.title(),
+                                      command=lambda _col=col: self._treeview_sort_column(self.tree, _col, False))
+                self.tree.column('system', width=100, anchor=tk.W)
+                self.tree.column('name', width=200, anchor=tk.W)
+                self.tree.column('status', width=100, anchor=tk.CENTER)
                 
-                display_name = name
-                # Prüfe, ob das Item im Set der Komponenten ist
-                if unique_name in self.app.component_item_uniquenames:
-                    display_name = f"{name} *"
+                base_query = "SELECT systemName, name, status FROM nodes"
+                params = []
+                search_term = self.search_var.get()
+                if search_term:
+                    base_query += " WHERE systemName LIKE ? OR name LIKE ?"
+                    params.extend([f"%{search_term}%", f"%{search_term}%"])
                 
-                # Füge die Zeile mit dem möglicherweise modifizierten Namen ein
-                self.tree.insert('', tk.END, values=(display_name, mr, status), tags=(status,))
-        
-        display_category = "All Items" if category == "Gesamtübersicht" else category
-        self.item_frame.config(text=f"Items: {display_category}")
-        self._treeview_sort_column(self.tree, self.sort_column, self.sort_reverse)
+                base_query += " ORDER BY systemName, name"
+                cursor.execute(base_query, params)
+                
+                for system, name, status_int in cursor.fetchall():
+                    status_text = NODE_STATUS_TEXT.get(status_int, "Unknown")
+                    self.tree.insert('', tk.END, values=(system, name, status_text), tags=(status_text,))
+            
+            # --- BLOCK 2: NEUE Logik für Ressourcen ---
+            elif category == "Resources":
+                cols = ('name',)
+                self.tree.config(columns=cols, show='headings')
+                self.tree.heading('name', text='Resource Name', 
+                                  command=lambda: self._treeview_sort_column(self.tree, 'name', False))
+                self.tree.column('name', width=400, anchor=tk.W)
+
+                needed_keys = self.app.resource_tracker_tab.needed_data.keys()
+                spent_keys = self.app.resource_tracker_tab.spent_data.keys()
+                all_resource_unames = sorted(list(set(needed_keys) | set(spent_keys)))
+                name_map = self.app.full_item_name_map
+                
+                # --- KORREKTUR HIER ---
+                # Hole eine saubere Referenz auf unsere neue Filtermethode
+                should_exclude_func = self.app.resource_tracker_tab._should_exclude
+
+                for uname in all_resource_unames:
+                    display_name = name_map.get(uname, uname.split('/')[-1])
+                    
+                    # Wende die Filterfunktion an
+                    if not should_exclude_func(display_name) and self.search_var.get().lower() in display_name.lower():
+                        self.tree.insert('', tk.END, values=(display_name,))
+
+
+            # --- BLOCK 3: Logik für alle normalen Item-Kategorien ---
+            else:
+                cols = ('name', 'mr', 'status')
+                self.tree.config(columns=cols)
+                for col in cols:
+                    self.tree.heading(col, text=col.title(), command=lambda _col=col: self._treeview_sort_column(self.tree, _col, False))
+                self.tree.column('name', width=250)
+                self.tree.column('mr', width=50, anchor=tk.CENTER)
+                self.tree.column('status', width=100, anchor=tk.CENTER)
+                
+                base_query = "SELECT name, mastery_rank, status, uniqueName FROM items"
+                where_clauses, params = [], []
+                if category not in ("Gesamtübersicht", "All Items"):
+                     where_clauses.append("category = ?")
+                     params.append(category)
+                search_term = self.search_var.get()
+                if search_term:
+                    where_clauses.append("name LIKE ?")
+                    params.append(f"%{search_term}%")
+                if self.hide_mastered_var.get():
+                    where_clauses.append("status != 'Mastered'")
+                if self.hide_primes_var.get():
+                    where_clauses.append("name NOT LIKE '% Prime'")
+                query = base_query
+                if where_clauses:
+                    query += " WHERE " + " AND ".join(where_clauses)
+                query += " ORDER BY name"
+                cursor.execute(query, params)
+                
+                for row in cursor.fetchall():
+                    name, mr, status, unique_name = row
+                    display_name = name
+                    if unique_name in self.app.component_item_uniquenames:
+                        display_name = f"{name} *"
+                    
+                    self.tree.insert('', tk.END, values=(display_name, mr, status), tags=(status,))
+            
+            # --- Abschließender Code, der für alle Kategorien gilt ---
+            display_category = "All Items" if category == "Gesamtübersicht" else category
+            self.item_frame.config(text=f"Items: {display_category}")
+            self._treeview_sort_column(self.tree, self.sort_column, self.sort_reverse)
 
     # -------------------------------
     # Tree setup
     # -------------------------------
     def create_item_treeview(self):
+        # Der Frame, in den alles gepackt wird, existiert bereits: self.item_frame
+        
+        # --- NEU: Erstelle die Scrollbar ---
+        scrollbar = ttk.Scrollbar(self.item_frame, orient=tk.VERTICAL)
+        
+        # Erstelle die Treeview wie bisher
         cols = ('name', 'mr', 'status')
         self.tree = ttk.Treeview(self.item_frame, columns=cols, show='headings')
+        
+        # --- NEU: Verbinde die Scrollbar und die Treeview miteinander (2-Wege-Kommunikation) ---
+        # 1. Sage der Scrollbar, dass sie die Treeview steuern soll
+        scrollbar.config(command=self.tree.yview)
+        # 2. Sage der Treeview, dass sie die Scrollbar aktualisieren soll
+        self.tree.config(yscrollcommand=scrollbar.set)
+
+        # Konfiguriere die Spalten wie bisher
         for col in cols:
             self.tree.heading(col, text=col.title(),
                               command=lambda _col=col: self._treeview_sort_column(self.tree, _col, False))
         self.tree.column('name', width=250)
         self.tree.column('mr', width=50, anchor=tk.CENTER)
         self.tree.column('status', width=100, anchor=tk.CENTER)
-        self.tree.pack(fill=tk.BOTH, expand=True)
+        
+        # --- NEU: Platziere die Scrollbar und die Treeview im Layout ---
+        # Packe die Scrollbar an den rechten Rand. Sie soll sich nur in der Höhe anpassen.
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        # Packe die Treeview danach. Sie füllt den gesamten restlichen Platz aus.
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Der Rest der Methode (Tags und Bindings) bleibt unverändert
         for status, color in STATUS_TEXT_COLORS.items():
             self.tree.tag_configure(status, foreground=color)
         for status, color in STATUS_NODE_COLORS.items():
@@ -1552,15 +2032,16 @@ class MasteryTrackerTab(ttk.Frame):
         self.tree.bind("<Control-a>", self._select_all)
         self.tree.bind("<Control-c>", self._copy_selection)
 
+
     def update_multiple_statuses(self, item_names, new_status):
+        # --- SCHRITT 1: Speichere die aktuelle Scroll-Position ---
+        current_view = self.tree.yview()
+
         selected_ids = self.tree.selection()
-        
-        # --- KORREKTUR TEIL 1: Bereinige die Namen, bevor sie in der DB verwendet werden ---
         clean_item_names = [name.strip(" *") for name in item_names]
         selected_item_names = [self.tree.item(item_id, 'values')[0].strip(" *") for item_id in selected_ids]
 
         cursor = self.app.conn.cursor()
-        # Verwende die bereinigten Namen für die DB-Abfrage
         updates = [(new_status, name) for name in clean_item_names]
         cursor.executemany("UPDATE items SET status = ? WHERE name = ?", updates)
         self.app.conn.commit()
@@ -1568,17 +2049,19 @@ class MasteryTrackerTab(ttk.Frame):
         self.display_items(self.current_category)
         self.app.update_all_summaries()
         
-        # --- KORREKTUR TEIL 2: Verwende die bereinigten Namen auch für die Wiederherstellung der Auswahl ---
         ids_to_reselect = []
         for item_id in self.tree.get_children():
-            # Vergleiche bereinigten Namen mit bereinigten Namen
             if self.tree.item(item_id, 'values')[0].strip(" *") in selected_item_names:
                 ids_to_reselect.append(item_id)
                 
         if ids_to_reselect:
             self.tree.selection_set(ids_to_reselect)
             self.tree.focus(ids_to_reselect[0])
-            self.tree.see(ids_to_reselect[0])
+            # --- SCHRITT 2: Entferne den Befehl, der das Springen verursacht ---
+            # self.tree.see(ids_to_reselect[0]) # AUSKOMMENTIERT
+            
+        # --- SCHRITT 3: Setze die Scroll-Position zurück ---
+        self.tree.yview_moveto(current_view[0])
             
         self.app.update_status_bar(f"{len(clean_item_names)} Item(s) set to '{new_status}'.")
 
@@ -1587,41 +2070,68 @@ class MasteryTrackerTab(ttk.Frame):
         if not item_id: return
         
         if self.current_category == "Star Chart":
-            # (This part is fine and needs no changes)
+            # Hole den aktuellen Status-Text (z.B. "Completed") aus der Tabelle
+            current_status_text = self.tree.item(item_id, 'values')[2]
+            
+            # Finde den zugehörigen numerischen Schlüssel (z.B. 1)
+            current_status_int = 0 # Fallback-Wert
+            for key, value in NODE_STATUS_TEXT.items():
+                if value == current_status_text:
+                    current_status_int = key
+                    break
+            
+            # Schalte zum nächsten Status um (0 -> 1 -> 2 -> 0)
+            new_status = (current_status_int + 1) % len(NODE_STATUS_TEXT)
+            
             node_name = self.tree.item(item_id, 'values')[1]
-            # ...
             self.update_node_status([node_name], new_status)
-        else: # Item-Logik
+
+        elif self.current_category == "Resources":
+            self.on_item_select(None)
+
+        else: # Gilt nur für normale Items
             current_status = self.tree.item(item_id, 'values')[2]
             new_status = "Missing" if current_status == "Mastered" else "Mastered"
-            
-            # --- KORREKTUR: Bereinige den Namen, bevor er an die Update-Funktion übergeben wird ---
             display_name = self.tree.item(item_id, 'values')[0]
-            item_name = display_name.strip(" *")
+            self.update_multiple_statuses([display_name], new_status)
             
-            self.update_multiple_statuses([item_name], new_status)
 
     def update_node_status(self, node_names, new_status_int):
+        # --- SCHRITT 1: Speichere die aktuelle Scroll-Position ---
+        current_view = self.tree.yview()
+
         selected_ids = self.tree.selection()
         selected_node_names = [self.tree.item(item_id, 'values')[1] for item_id in selected_ids]
         cursor = self.app.conn.cursor()
         updates = [(new_status_int, name) for name in node_names]
         cursor.executemany("UPDATE nodes SET status = ? WHERE name = ?", updates)
         self.app.conn.commit()
+
         self.display_items(self.current_category)
         self.app.update_all_summaries()
+
         ids_to_reselect = []
         for item_id in self.tree.get_children():
             if self.tree.item(item_id, 'values')[1] in selected_node_names:
                 ids_to_reselect.append(item_id)
+
         if ids_to_reselect:
             self.tree.selection_set(ids_to_reselect)
             self.tree.focus(ids_to_reselect[0])
-            self.tree.see(ids_to_reselect[0])
+            # --- SCHRITT 2: Entferne den Befehl, der das Springen verursacht ---
+            # self.tree.see(ids_to_reselect[0]) # AUSKOMMENTIERT
+
+        # --- SCHRITT 3: Setze die Scroll-Position zurück ---
+        self.tree.yview_moveto(current_view[0])
+
         status_text = NODE_STATUS_TEXT.get(new_status_int)
-        self.app.update_status_bar(f"{len(node_names)} Node(s) set to '{status_text}'.")  
+        self.app.update_status_bar(f"{len(node_names)} Node(s) set to '{status_text}'.") 
 
     def handle_key_press(self, event):
+        # --- KORREKTUR HIER ---
+        # Wenn wir in der Ressourcen- oder Sternenkarten-Ansicht sind, ignoriere die Tasten.
+        if self.current_category in ("Resources", "Star Chart"):
+            return
         key_map = {'m': "Mastered", 's': "Missing", 'b': "Building", 'u': "Built", 'l': "Leveling"}
         pressed_key = event.keysym.lower()
         if pressed_key in key_map:
@@ -1639,26 +2149,40 @@ class MasteryTrackerTab(ttk.Frame):
     def _show_context_menu(self, event):
         clicked_item_id = self.tree.identify_row(event.y)
         if not clicked_item_id: return
+    
         current_selection = self.tree.selection()
         if clicked_item_id not in current_selection:
             self.tree.selection_set(clicked_item_id)
             self.tree.focus(clicked_item_id)
+            
         final_selection_ids = self.tree.selection()
         if not final_selection_ids: return
+        
         self.context_menu.delete(0, tk.END)
+
+        # --- Finale Logik mit der Korrektur für "Resources" ---
         if self.current_category == "Star Chart":
             node_names = [self.tree.item(sid, 'values')[1] for sid in final_selection_ids]
-            self.context_menu.add_command(label=f"Set to '{NODE_STATUS_TEXT[1]}' ({len(node_names)} Nodes)", command=lambda: self.update_node_status(node_names, 1))  
-            self.context_menu.add_command(label=f"Set to '{NODE_STATUS_TEXT[2]}' ({len(node_names)} Nodes)", command=lambda: self.update_node_status(node_names, 2))  
-            self.context_menu.add_command(label=f"Set to '{NODE_STATUS_TEXT[0]}' ({len(node_names)} Nodes)", command=lambda: self.update_node_status(node_names, 0))  
+            self.context_menu.add_command(label=f"Set to '{NODE_STATUS_TEXT[1]}'", command=lambda: self.update_node_status(node_names, 1))
+            self.context_menu.add_command(label=f"Set to '{NODE_STATUS_TEXT[2]}'", command=lambda: self.update_node_status(node_names, 2))
+            self.context_menu.add_command(label=f"Set to '{NODE_STATUS_TEXT[0]}'", command=lambda: self.update_node_status(node_names, 0))
             self.context_menu.add_separator()
             self.context_menu.add_command(label="Open in Wiki", command=self._open_wiki_for_node)
-        else:
+
+        elif self.current_category == "Resources":
+            # --- HIER IST DIE KORREKTUR ---
+            # Für Ressourcen ist nur "Open in Wiki" sinnvoll, da ein Einzelklick
+            # bereits die Fundorte anzeigt. Der redundante Eintrag wurde entfernt.
+            self.context_menu.add_command(label="Open in Wiki", command=self._open_wiki_for_item)
+            # --- ENDE DER KORREKTUR ---
+
+        else: # Dies gilt für alle normalen Items
             item_names = [self.tree.item(sid, 'values')[0] for sid in final_selection_ids]
             for status in STATUS_OPTIONS:
-                self.context_menu.add_command(label=f"Set to '{status}' ({len(item_names)} Items)", command=lambda s=status: self.update_multiple_statuses(item_names, s))  
+                self.context_menu.add_command(label=f"Set to '{status}'", command=lambda s=status: self.update_multiple_statuses(item_names, s))
             self.context_menu.add_separator()
             self.context_menu.add_command(label="Open in Wiki", command=self._open_wiki_for_item)
+
         self.context_menu.post(event.x_root, event.y_root)
 
     def _open_wiki_for_node(self):
@@ -1696,27 +2220,40 @@ class MasteryTrackerTab(ttk.Frame):
             values = self.tree.item(selected_item_id)['values']
             
             if self.current_category == "Star Chart":
-                # This part is fine, as Star Chart names don't have a '*'
                 self.detail_panel.update_with_item(values)
+            
+            # NEUER LOGIK-BLOCK
+            elif self.current_category == "Resources":
+                resource_name = values[0]
+                # Wir verwenden die bereits existierende Funktion, um die Fundorte anzuzeigen!
+                self.show_drop_locations_for_item(resource_name)
+
             else:
-                # --- KORREKTUR: Bereinige den Namen, bevor er an das DetailPanel gesendet wird ---
                 display_name = values[0]
-                clean_name = display_name.strip(" *")
-                
-                # Übergebe den sauberen Namen an das DetailPanel
-                self.detail_panel.update_with_item(clean_name)
+                self.detail_panel.update_with_item(display_name)
         else:
             self.detail_panel.clear_panel()
 
     def create_category_buttons(self):
-        # Translate category names for display
-        display_names = {
-            "Gesamtübersicht": "All Items",
-            "Warframe": "Warframes", # Plural for button
-        }
-        for category in CATEGORIES:
-            btn_text = display_names.get(category, category)
-            ttk.Button(self.category_frame, text=btn_text, command=lambda c=category: self.handle_category_click(c)).pack(fill=tk.X, pady=2)
+            display_names = {"Gesamtübersicht": "All Items", "Warframe": "Warframes"}
+
+            # Gehe die gesamte CATEGORIES-Liste in der vorgegebenen Reihenfolge durch
+            for category in CATEGORIES:
+                # FÜGE EINE TRENNLINIE HINZU, BEVOR wir den "Resources"-Button zeichnen
+                if category == "Resources":
+                    ttk.Separator(self.category_frame).pack(side=tk.TOP, fill=tk.X, pady=5)
+                
+                # Hole den Anzeigenamen für den Button
+                btn_text = display_names.get(category, category)
+                
+                # Erstelle und packe den Button
+                ttk.Button(
+                    self.category_frame, text=btn_text, 
+                    command=lambda c=category: self.handle_category_click(c)
+                ).pack(side=tk.TOP, fill=tk.X, pady=2)
+
+
+
 
     def create_summary_display(self):
         self.stats_frame = ttk.Frame(self.summary_frame)
@@ -1770,15 +2307,15 @@ class MasteryTrackerTab(ttk.Frame):
                     self.diagram_canvas.create_rectangle(current_x, 0, current_x + bar_width, self.diagram_canvas.winfo_height(), fill=STATUS_COLORS.get(status, "#FFFFFF"), outline="")
                     current_x += bar_width
     
-    # Diese neue Methode gehört in die MasteryTrackerTab-Klasse
+# In der MasteryTrackerTab-Klasse
     def show_drop_locations_for_item(self, item_name):
         """
         Wird von anderen Tabs aufgerufen, um direkt die Fundorte für ein Item/Ressource
         im DetailPanel anzuzeigen.
         """
-        # Leere die Haupt-Item-Liste, da wir kein spezifisches Item aus der Liste anzeigen
-        for item in self.tree.get_children():
-            self.tree.delete(item)
+        # --- NEU: Schalte das DetailPanel in die Ressourcen-Ansicht ---
+        self.detail_panel.set_view_for_resource(True)
+
         self.item_frame.config(text=f"Showing Drop Locations for: {item_name}")
 
         # Rufe direkt die Drop-Location-Logik des DetailPanels auf
@@ -1786,18 +2323,14 @@ class MasteryTrackerTab(ttk.Frame):
         
         # Aktualisiere den Titel und die Beschreibung im DetailPanel
         self.detail_panel.name_label.config(text=f"Drop Locations for {item_name}")
-        self.detail_panel.description_text.config(state=tk.NORMAL)
-        self.detail_panel.description_text.delete(1.0, tk.END)
-        self.detail_panel.description_text.insert(tk.END, f"Showing all known drop locations for the resource '{item_name}'.\n\nComponent list is not applicable.")
-        self.detail_panel.description_text.config(state=tk.DISABLED)
-        self.detail_panel.image_label.config(image=None) # Ressourcen haben oft kein gutes Einzelbild
+        set_text(self.detail_panel.description_text, f"Showing all known drop locations for the resource '{item_name}'.\n\nComponent list is not applicable.")
+        self.detail_panel.image_label.config(image=None)
         
-        # Leere die Komponentenliste
-        for i in self.detail_panel.components_tree.get_children(): 
-            self.detail_panel.components_tree.delete(i)
+        # Leere die Komponentenliste (obwohl sie versteckt ist, ist das saubere Praxis)
+        clear_tree(self.detail_panel.components_tree)
         self.detail_panel.components_tree.insert('', tk.END, values=("Not applicable", ""))
-
-
+        
+        
 class ChartBrowser(ttk.Frame):
     def __init__(self, parent, **kwargs):
         super().__init__(parent, **kwargs)
@@ -1939,19 +2472,44 @@ class LiveTickerTab(ttk.Frame):
 
     # --- Sortierfunktion ---
     def _treeview_sort_column(self, tree, col, reverse):
-        """Sortiert eine Treeview-Spalte und merkt sich die Sortierung pro Tree."""
-        self.sort_states[tree] = (col, reverse)
+        # 1. Speichere den neuen Sortierzustand
+        self.sort_column = col
+        self.sort_reverse = reverse
 
-        items = [(tree.set(k, col), k) for k in tree.get_children("")]
-        try:
-            items.sort(key=lambda t: int(str(t[0]).replace(",", "")), reverse=reverse)
-        except ValueError:
-            items.sort(key=lambda t: str(t[0]).lower(), reverse=reverse)
+        # 2. Hole alle Daten aus der Treeview
+        # Wichtig: Wir holen die Daten, bevor wir sie sortieren
+        l = [(tree.set(k, col), k) for k in tree.get_children("")]
 
-        for index, (val, k) in enumerate(items):
+        # --- 3. HIER IST DIE KORREKTUR: Explizite Sortierlogik ---
+        # Definiere eine Funktion, die entscheidet, wie sortiert wird.
+        def sort_key(item):
+            value = item[0]
+            # Wenn wir nach der 'mr'-Spalte sortieren, behandle den Wert als Zahl.
+            if col == 'mr':
+                try:
+                    return int(value)
+                except (ValueError, TypeError):
+                    return 0 # Fallback für leere oder ungültige Werte
+            # Für alle anderen Spalten, behandle den Wert als Text (in Kleinbuchstaben).
+            else:
+                return str(value).lower()
+
+        # 4. Führe die Sortierung mit unserer neuen, sauberen Logik durch
+        l.sort(key=sort_key, reverse=reverse)
+        # --- ENDE DER KORREKTUR ---
+
+        # 5. Ordne die Elemente in der Treeview neu an
+        for index, (val, k) in enumerate(l):
             tree.move(k, "", index)
 
-        tree.heading(col, command=lambda: self._treeview_sort_column(tree, col, not reverse))
+        # 6. Aktualisiere alle Spalten-Header, damit der nächste Klick funktioniert
+        for c in tree["columns"]:
+            if c == col:
+                # Für die aktive Spalte: Nächster Klick kehrt die Richtung um
+                tree.heading(c, command=lambda _c=c: self._treeview_sort_column(tree, _c, not reverse))
+            else:
+                # Für alle anderen Spalten: Nächster Klick startet eine neue Sortierung
+                tree.heading(c, command=lambda _c=c: self._treeview_sort_column(tree, _c, False))
 
     def resort_tree(self, tree):
         """Wendet die gespeicherte Sortierung für einen Tree an, falls gültig."""
@@ -1981,19 +2539,55 @@ class LiveTickerTab(ttk.Frame):
         # Environments
         cetus_data = worldstate_data.get('cetusCycle')
         if cetus_data:
-            self.cetus_lbl.config(text=f"Cetus: {'Day' if cetus_data['isDay'] else 'Night'} (Ends in: {cetus_data['shortString']})")
+            self.cetus_lbl.config(text=f"Cetus: {'Day' if cetus_data.get('isDay') else 'Night'} (Ends in: {cetus_data.get('timeLeft', 'N/A')})")
 
+        # Orb Vallis
         vallis_data = worldstate_data.get('vallisCycle')
         if vallis_data:
-            self.vallis_lbl.config(text=f"Orb Vallis: {'Warm' if vallis_data['isWarm'] else 'Cold'} (Ends in: {vallis_data['shortString']})")
+            try:
+                expiry_str = vallis_data.get('expiry')
+                state_is_warm = vallis_data.get('isWarm', False)
+
+                if expiry_str:
+                    expiry_dt = datetime.fromisoformat(expiry_str.replace('Z', '+00:00'))
+                    now_dt = datetime.now(timezone.utc)
+
+                    remaining_seconds = (expiry_dt - now_dt).total_seconds()
+
+                    # Solange wir "in der Vergangenheit" sind, springe in den nächsten Zyklus
+                    while remaining_seconds <= 0:
+                        if state_is_warm:
+                            # Warm → Cold (20 Minuten)
+                            state_is_warm = False
+                            expiry_dt += timedelta(seconds=1200)
+                        else:
+                            # Cold → Warm (6:40 Minuten)
+                            state_is_warm = True
+                            expiry_dt += timedelta(seconds=400)
+                        remaining_seconds = (expiry_dt - now_dt).total_seconds()
+
+                    time_left_str = self.format_time(remaining_seconds)
+                else:
+                    time_left_str = "N/A"
+
+                self.vallis_lbl.config(
+                    text=f"Orb Vallis: {'Warm' if state_is_warm else 'Cold'} "
+                         f"(Ends in: {time_left_str})"
+                )
+            except Exception as e:
+                print(f"Error parsing Vallis time: {e}")
+                self.vallis_lbl.config(
+                    text=f"Orb Vallis: {'Warm' if vallis_data.get('isWarm') else 'Cold'} (Ends in: Error)")
+
 
         cambion_data = worldstate_data.get('cambionCycle')
         if cambion_data:
-            self.cambion_lbl.config(text=f"Cambion: {cambion_data['active'].upper()} (Ends in: {cambion_data['timeLeft']})")
+            active_state = 'VOME' if cambion_data.get('isVome') else 'FASS'
+            self.cambion_lbl.config(text=f"Cambion: {active_state} (Ends in: {cambion_data.get('timeLeft', 'N/A')})")
 
-        # Trader
+        # Trader (aus Haupt-API)
         trader_list = worldstate_data.get("VoidTraders")
-        if trader_list:
+        if trader_list and trader_list[0]:
             data = trader_list[0]
             activation_ms = int(data['Activation']['$date']['$numberLong'])
             expiry_ms = int(data['Expiry']['$date']['$numberLong'])
@@ -2002,20 +2596,19 @@ class LiveTickerTab(ttk.Frame):
             now = datetime.now(timezone.utc)
 
             if now < activation:
-                self.trader_lbl.config(text=f"Baro Ki'Teer arrives at {data['Node']} in: {self.format_time((activation - now).total_seconds())}")
+                self.trader_lbl.config(text=f"Baro Ki'Teer arrives at {data.get('Node', 'N/A')} in: {self.format_time((activation - now).total_seconds())}")
+                for row in self.trader_tree.get_children(): self.trader_tree.delete(row)
             else:
-                self.trader_lbl.config(text=f"Baro Ki'Teer is at {data['Node']} and leaves in: {self.format_time((expiry - now).total_seconds())}")
+                self.trader_lbl.config(text=f"Baro Ki'Teer is at {data.get('Node', 'N/A')} and leaves in: {self.format_time((expiry - now).total_seconds())}")
+                for row in self.trader_tree.get_children(): self.trader_tree.delete(row)
+                for item in data.get("Manifest", []):
+                    name_parts = item.get("ItemType", "Unknown").split("/")
+                    name = name_parts[-1].replace("Prime", " Prime") if name_parts else "Unknown"
+                    self.trader_tree.insert("", "end", values=(name, item.get("PrimePrice", 0), f"{item.get('RegularPrice', 0):,}"))
 
-            for row in self.trader_tree.get_children():
-                self.trader_tree.delete(row)
-            for item in data.get("Manifest", []):
-                name_parts = item.get("ItemType", "Unknown").split("/")
-                name = name_parts[-1] if name_parts else "Unknown"
-                self.trader_tree.insert("", "end", values=(name, item.get("PrimePrice", 0), f"{item.get('RegularPrice', 0):,}"))
-
-        # Sortie
+        # Sortie (aus Haupt-API)
         sortie_list = worldstate_data.get("Sorties")
-        if sortie_list:
+        if sortie_list and sortie_list[0]:
             data = sortie_list[0]
             expiry_ms = int(data['Expiry']['$date']['$numberLong'])
             expiry = datetime.fromtimestamp(expiry_ms / 1000, tz=timezone.utc)
@@ -2025,9 +2618,9 @@ class LiveTickerTab(ttk.Frame):
             self.sortie_title_lbl.config(text=f"Sortie: {boss_name}")
             self.sortie_lbl.config(text=f"Time Remaining: {self.format_time(remaining.total_seconds())}\nMissions:\n{missions}")
 
-        # Archon Hunt
+        # Archon Hunt (aus Haupt-API)
         archon_list = worldstate_data.get("LiteSorties")
-        if archon_list:
+        if archon_list and archon_list[0]:
             data = archon_list[0]
             expiry_ms = int(data['Expiry']['$date']['$numberLong'])
             expiry = datetime.fromtimestamp(expiry_ms / 1000, tz=timezone.utc)
@@ -2037,42 +2630,33 @@ class LiveTickerTab(ttk.Frame):
             self.archon_title_lbl.config(text=f"Archon Hunt: {boss_name}")
             self.archon_lbl.config(text=f"Time Remaining: {self.format_time(remaining.total_seconds())}\nMissions:\n{missions}")
 
-        # Nightwave
-        # --- KORREKTUR: Nutzt jetzt die neuen, besseren Daten von 'api.warframestat.us' ---
-        nw_data = worldstate_data.get('nightwave') # <-- Greift auf den neuen 'nightwave'-Schlüssel zu
-        if nw_data and nw_data.get('active'):
-            # Info-Label
-            season = nw_data.get("season", "?")
-            tag = nw_data.get("tag", "Nora's Mix")
-            expiry_str = nw_data.get('expiry', '')
-            
+        # Nightwave (aus zweiter API)
+        nw_data = worldstate_data.get('nightwave')
+        if nw_data and nw_data.get('activeChallenges') is not None:
             try:
-                # Zeit bis zum Ablauf berechnen
+                season = nw_data.get("season", "?")
+                tag = nw_data.get("tag", "Nora's Mix")
+                expiry_str = nw_data.get('expiry', '')
+                
                 expiry_dt = datetime.fromisoformat(expiry_str.replace('Z', '+00:00'))
                 remaining = expiry_dt - datetime.now(timezone.utc)
                 self.nightwave_info_lbl.config(text=f"{tag} (Season {season}) - Ends in: {self.format_time(remaining.total_seconds())}")
-            except (ValueError, TypeError):
-                self.nightwave_info_lbl.config(text=f"{tag} (Season {season})")
 
-            # Treeview füllen
-            for row in self.nightwave_tree.get_children():
-                self.nightwave_tree.delete(row)
-            
-            # Die neue API verwendet 'activeChallenges' (camelCase)
-            for ch in nw_data.get('activeChallenges', []):
-                # 'desc' ist hier immer vorhanden und korrekt
-                description = ch.get("desc", "Unknown Challenge")
-                reputation = f"{ch.get('reputation', 0):,}"
-                self.nightwave_tree.insert("", "end", values=(description, reputation))
+                for row in self.nightwave_tree.get_children(): self.nightwave_tree.delete(row)
+                
+                for ch in nw_data.get('activeChallenges', []):
+                    description = ch.get("desc", "Unknown Challenge")
+                    reputation = f"{ch.get('reputation', 0):,}"
+                    self.nightwave_tree.insert("", "end", values=(description, reputation))
+            except Exception as e:
+                self.nightwave_info_lbl.config(text="Error parsing Nightwave data.")
+                print(f"Error processing Nightwave data: {e}")
         else:
             self.nightwave_info_lbl.config(text="No active Nightwave season.")
-            for row in self.nightwave_tree.get_children():
-                self.nightwave_tree.delete(row)
+            for row in self.nightwave_tree.get_children(): self.nightwave_tree.delete(row)
 
-        # --- Sortierung nach dem Refresh wieder anwenden ---
         self.resort_tree(self.nightwave_tree)
         self.resort_tree(self.trader_tree)
-
 
 # --- NEUE RELIC FINDER KLASSE ---
 class RelicFinderTab(ttk.Frame):
@@ -2398,7 +2982,7 @@ class ResourceTrackerTab(ttk.Frame):
         self.needed_data = {}
         self.spent_data = {}
         self.all_masterable_item_uniquenames = set()
-
+        self.last_focused_tree = None
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
 
@@ -2436,6 +3020,12 @@ class ResourceTrackerTab(ttk.Frame):
 
     def _show_context_menu(self, event):
         tree = event.widget
+        
+        # --- HIER IST DIE WICHTIGE ÄNDERUNG ---
+        # Wir speichern, welche Tabelle den Rechtsklick ausgelöst hat
+        self.last_focused_tree = tree
+        # --- ENDE DER ÄNDERUNG ---
+        
         item_id = tree.identify_row(event.y)
         if item_id:
             tree.selection_set(item_id)
@@ -2443,13 +3033,20 @@ class ResourceTrackerTab(ttk.Frame):
             self.context_menu.post(event.x_root, event.y_root)
 
     def _find_drop_locations(self):
-        focused_tree = self.focus_get()
-        if focused_tree not in [self.needed_tree, self.spent_tree]:
-            return
+        # --- HIER IST DIE WICHTIGE ÄNDERUNG ---
+        # Wir verwenden die gespeicherte Referenz anstatt self.focus_get()
+        focused_tree = self.last_focused_tree
+        if not focused_tree:
+            return # Sicherheitsabfrage, falls nichts gespeichert ist
+        # --- ENDE DER ÄNDERUNG ---
+
         selected_item_id = focused_tree.focus()
         if not selected_item_id:
             return
+            
         resource_name = focused_tree.item(selected_item_id, 'values')[0]
+        
+        # Der Rest der Funktion ist bereits korrekt
         self.app.notebook.select(self.app.mastery_tracker_tab)
         self.app.mastery_tracker_tab.show_drop_locations_for_item(resource_name)
 
@@ -2465,6 +3062,20 @@ class ResourceTrackerTab(ttk.Frame):
         url = f"https://wiki.warframe.com/w/{formatted_name}"
         webbrowser.open_new_tab(url)
         self.app.update_status_bar(f"Opening wiki for {resource_name}...")
+    
+    def _should_exclude(self, item_name):
+        """Prüft, ob ein Itemname basierend auf den globalen Keywords eine Ressource oder eine Komponente ist."""
+        name_lower = item_name.lower()
+        if name_lower in RESOURCE_TRACKER_EXCLUSION_EXCEPTIONS:
+            return False
+        for keyword in RESOURCE_TRACKER_CONTAINS_KEYWORDS:
+            if keyword in name_lower:
+                return True
+        for keyword in RESOURCE_TRACKER_ENDSWITH_KEYWORDS:
+            if name_lower.endswith(keyword):
+                return True
+        return False
+
 
     # -------------------------------
     # Tree setup & sorting
@@ -2572,29 +3183,22 @@ class ResourceTrackerTab(ttk.Frame):
     def _populate_results(self, *args):
         for tree in [self.needed_tree, self.spent_tree]:
             for i in tree.get_children(): tree.delete(i)
+        
         name_map = self.app.full_item_name_map
 
-        def should_exclude(item_name):
-            name_lower = item_name.lower()
-            if name_lower in RESOURCE_TRACKER_EXCLUSION_EXCEPTIONS:
-                return False
-            for keyword in RESOURCE_TRACKER_CONTAINS_KEYWORDS:
-                if keyword in name_lower:
-                    return True
-            for keyword in RESOURCE_TRACKER_ENDSWITH_KEYWORDS:
-                if name_lower.endswith(keyword):
-                    return True
-            return False
-
+        # HINWEIS: Die 'def should_exclude(...)' ist jetzt weg.
+        
+        # Wir verwenden jetzt self._should_exclude
         filtered_needed_data = {
             key: value for key, value in self.needed_data.items()
-            if not should_exclude(name_map.get(key, key))
+            if not self._should_exclude(name_map.get(key, key))
         }
         filtered_spent_data = {
             key: value for key, value in self.spent_data.items()
-            if not should_exclude(name_map.get(key, key))
+            if not self._should_exclude(name_map.get(key, key))
         }
 
+        # Der Rest der Methode bleibt exakt gleich...
         search_term = self.search_var.get().lower()
         needed_to_display = filtered_needed_data
         if search_term:
@@ -2626,14 +3230,12 @@ class ResourceTrackerTab(ttk.Frame):
             self.app.update_status_bar("Resource calculation complete.")
 
 
-
 # --- HAUPTANWENDUNG ---
 class WarframeTrackerApp:
     def __init__(self, root):
             self.component_item_uniquenames = set()
             self.full_item_name_map = {}
             self.recipes_data = {}
-            self.unique_name_map = {}
             self.root = root
             self.root.title("Warframe Mastery Dashboard")
             self.root.geometry("1400x900")
@@ -2652,15 +3254,16 @@ class WarframeTrackerApp:
             self.notebook = ttk.Notebook(self.root)
             self.notebook.pack(expand=True, fill='both', padx=10, pady=10)
             
-            # Create the status bar BEFORE creating any tabs that might use it.
-            self.status_bar = ttk.Label(self.root, text="Initialisiere...", anchor=tk.W)
+            self.status_bar = ttk.Label(self.root, text="Initializing...", anchor=tk.W)
             self.status_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 5))
+            
+            self.mission_drop_data = {} # NEUE ZEILE
+            self.root = root
 
-            # --- ROBUST ICON LOADING LOGIC ---
+
             try:
                 script_dir = os.path.dirname(os.path.abspath(__file__))
                 icons_dir = os.path.join(script_dir, "icons")
-
                 self.icon_dashboard = tk.PhotoImage(file=os.path.join(icons_dir, "dashboard.png"))
                 self.icon_tracker = tk.PhotoImage(file=os.path.join(icons_dir, "tracker.png"))
                 self.icon_live = tk.PhotoImage(file=os.path.join(icons_dir, "live.png"))
@@ -2668,11 +3271,7 @@ class WarframeTrackerApp:
                 self.icon_resources = tk.PhotoImage(file=os.path.join(icons_dir, "resources.png"))
             except tk.TclError as e:
                 print(f"Could not load icons: {e}")
-                self.icon_dashboard = tk.PhotoImage()
-                self.icon_tracker = tk.PhotoImage()
-                self.icon_live = tk.PhotoImage()
-                self.icon_relic = tk.PhotoImage()
-                self.icon_resources = tk.PhotoImage()
+                self.icon_dashboard, self.icon_tracker, self.icon_live, self.icon_relic, self.icon_resources = (tk.PhotoImage(),)*5
             
             self.dashboard_tab = DashboardTab(self.notebook, self)
             self.mastery_tracker_tab = MasteryTrackerTab(self.notebook, self)
@@ -2714,7 +3313,6 @@ class WarframeTrackerApp:
                 ON CONFLICT(uniqueName) DO NOTHING
             """, rows)
             self.conn.commit()
-            print(f"Upserted {len(JUNCTIONS)} junctions.")
             
     def heal_zero_mastery_nodes(self):
             """
@@ -2765,12 +3363,49 @@ class WarframeTrackerApp:
 
                 # --- Schritt 3: Übergib die Daten an die UI ---
                 self.root.after(0, self.live_ticker_tab.update_worldstate, worldstate_data)
-                self.update_status_bar("Live data updated. Next update in 5 minutes.")
+                self.update_status_bar("Live data updated. Next update in 1 minute.")
 
             except Exception as e:
                 self.update_status_bar(f"Error fetching live data: {e}")
 
-            time.sleep(300)  # 5 minutes
+            time.sleep(60)  # 1 minute refresh cycle
+
+
+    def _load_mission_drop_data(self):
+        def worker():
+            self.update_status_bar("Downloading mission rewards data...")
+            try:
+                url = "https://raw.githubusercontent.com/WFCD/warframe-drop-data/refs/heads/main/data/missionRewards.json"
+                data = safe_get_json(url)
+                
+                inverted_index = {}
+                # Gehen Sie durch jeden Planeten, Knoten und jede Belohnung
+                for planet, nodes in data.get("missionRewards", {}).items():
+                    for node, details in nodes.items():
+                        game_mode = details.get("gameMode", "Mission")
+                        rewards = details.get("rewards", {})
+                        
+                        # Belohnungen können als Dictionary (Rotation A/B/C) oder als einfache Liste vorliegen
+                        if isinstance(rewards, dict):
+                            for rotation, items in rewards.items():
+                                for item in items:
+                                    # Speichern Sie jeden Fundort unter dem kleingeschriebenen Item-Namen
+                                    item_name = item.get("itemName", "").lower()
+                                    if item_name not in inverted_index:
+                                        inverted_index[item_name] = []
+                                    inverted_index[item_name].append({
+                                        "place": f"{planet}/{node} ({game_mode})",
+                                        "rotation": rotation,
+                                        "chance": item.get("chance", 0)
+                                    })
+                
+                self.mission_drop_data = inverted_index
+                self.update_status_bar("Mission rewards data processed.")
+            except Exception as e:
+                self.update_status_bar(f"Failed to load mission rewards: {e}")
+        
+        threading.Thread(target=worker, daemon=True).start()
+
 
     def _load_recipes_data(self):
         RECIPES_URL = "https://browse.wf/warframe-public-export-plus/ExportRecipes.json"
@@ -2801,44 +3436,59 @@ class WarframeTrackerApp:
 
     def start_live_data_updater(self): threading.Thread(target=self._live_data_loop, daemon=True).start()
     def setup_database(self):
-            self.conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-            cursor = self.conn.cursor()
-            
-            # --- Add new columns if they don't exist (for existing users) ---
-            try:
-                cursor.execute("ALTER TABLE items ADD COLUMN uniqueName TEXT DEFAULT ''")
-            except sqlite3.OperationalError:
-                pass # Column already exists
-            try:
-                cursor.execute("ALTER TABLE items ADD COLUMN build_price INTEGER DEFAULT 0")
-            except sqlite3.OperationalError:
-                pass # Column already exists
-            
-            # --- Updated CREATE statement for new users ---
-            cursor.execute('''CREATE TABLE IF NOT EXISTS items (
-                                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                name TEXT NOT NULL UNIQUE,
-                                uniqueName TEXT NOT NULL UNIQUE,
-                                category TEXT NOT NULL,
-                                mastery_rank INTEGER DEFAULT 0,
-                                status TEXT DEFAULT 'Missing',
-                                mastery_points INTEGER DEFAULT 0,
-                                description TEXT,
-                                image_name TEXT,
-                                components TEXT,
-                                build_price INTEGER DEFAULT 0
-                            )''')
-            cursor.execute('''CREATE TABLE IF NOT EXISTS nodes (
-                                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                uniqueName TEXT NOT NULL UNIQUE,
-                                name TEXT NOT NULL,
-                                systemName TEXT NOT NULL,
-                                nodeType INTEGER NOT NULL,
-                                mastery_points INTEGER NOT NULL,
-                                steel_path_mastery_points INTEGER NOT NULL,
-                                status INTEGER DEFAULT 0 NOT NULL 
-                            )''') # 0 = Incomplete, 1 = Normal, 2 = Steel Path
-            self.conn.commit()
+        self.conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        cursor = self.conn.cursor()
+
+        # --- DATENBANK-MIGRATIONEN ---
+        # Führe hier alle notwendigen Änderungen an der Datenbankstruktur durch,
+        # die seit der letzten Version hinzugekommen sind.
+        
+        # MIGRATION 1: Füge die 'user_progress'-Tabelle hinzu, falls sie nicht existiert
+        cursor.execute('''CREATE TABLE IF NOT EXISTS user_progress (
+                            key TEXT PRIMARY KEY NOT NULL,
+                            value INTEGER DEFAULT 0
+                        )''')
+
+        # MIGRATION 2: Initialisiere die Standardwerte für alle Intrinsics, falls sie fehlen
+        intrinsics_keys = [
+            'railjack_piloting', 'railjack_gunnery', 'railjack_tactical', 'railjack_engineering', 'railjack_command',
+            'drifter_combat', 'drifter_riding', 'drifter_opportunity', 'drifter_endurance', 'drifter_zenith'
+        ]
+        # 'INSERT OR IGNORE' ist der Schlüssel: Es fügt die Zeile nur ein, wenn der 'key' noch nicht existiert.
+        for key in intrinsics_keys:
+            cursor.execute("INSERT OR IGNORE INTO user_progress (key, value) VALUES (?, 0)", (key,))
+
+        self.conn.commit()
+
+        # --- Bestehende Tabellen-Erstellung für Neuinstallationen ---
+        # Diese 'CREATE TABLE IF NOT EXISTS'-Aufrufe sind sicher und können bleiben.
+        # Sie tun nichts, wenn die Tabellen bereits existieren.
+        cursor.execute('''CREATE TABLE IF NOT EXISTS items (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            name TEXT NOT NULL UNIQUE,
+                            uniqueName TEXT NOT NULL UNIQUE,
+                            category TEXT NOT NULL,
+                            mastery_rank INTEGER DEFAULT 0,
+                            status TEXT DEFAULT 'Missing',
+                            mastery_points INTEGER DEFAULT 0,
+                            description TEXT,
+                            image_name TEXT,
+                            components TEXT,
+                            build_price INTEGER DEFAULT 0
+                        )''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS nodes (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            uniqueName TEXT NOT NULL UNIQUE,
+                            name TEXT NOT NULL,
+                            systemName TEXT NOT NULL,
+                            nodeType INTEGER NOT NULL,
+                            mastery_points INTEGER NOT NULL,
+                            steel_path_mastery_points INTEGER NOT NULL,
+                            status INTEGER DEFAULT 0 NOT NULL 
+                        )''')
+        self.conn.commit()
+
+
     def initial_load(self):
         cursor = self.conn.cursor()
         cursor.execute("SELECT COUNT(id) FROM items")
@@ -2846,11 +3496,12 @@ class WarframeTrackerApp:
         
         if item_count == 0:
             def full_import():
-                self.update_status_bar("Starting full database import...")
-                # --- KORREKTUR: Übergebe 'self' (die App-Instanz) an die Funktion ---
-                populate_database_from_api(self, self.conn, self.update_status_bar)
+                # Zuerst die Namens-Karte erstellen
+                build_full_name_map(self, self.update_status_bar)
                 
-                populate_nodes_from_api(self.conn, self.update_status_bar) 
+                self.update_status_bar("Starting full database import...")
+                populate_database_from_api(self, self.conn, self.update_status_bar)
+                populate_nodes_from_api(self.conn, self.update_status_bar)
                 self.upsert_junctions() 
                 populate_nodes_mastery_from_public_export(self.conn, self.update_status_bar)
                 download_all_images(self.conn, self.update_status_bar)
@@ -2861,23 +3512,25 @@ class WarframeTrackerApp:
             import_thread.start()
             self.root.after(100, self.check_import_thread, import_thread)
         else: 
-            # Auch für bestehende DBs müssen wir die Namens-Karte füllen
-            threading.Thread(target=populate_database_from_api, 
-                             args=(self, self.conn, self.update_status_bar), 
-                             daemon=True).start()
-            
-            self.upsert_junctions()
-            populate_nodes_mastery_from_public_export(self.conn, self.update_status_bar)
-            self.heal_zero_mastery_nodes()
-            threading.Thread(target=download_planet_images, 
-                             args=(self.update_status_bar,), 
-                             daemon=True).start()
-            self.update_status_bar("Database loaded. Ready.")
-            self.finalize_load()
-        
-        recipe_thread = threading.Thread(target=self._load_recipes_data, daemon=True)
-        recipe_thread.start()
+            def update_and_finalize_task():
+                # Zuerst die Namens-Karte erstellen
+                build_full_name_map(self, self.update_status_bar)
                 
+                # Dann den Rest ausführen
+                self.run_database_migrations()
+                self.upsert_junctions()
+                populate_nodes_mastery_from_public_export(self.conn, self.update_status_bar)
+                self.heal_zero_mastery_nodes()
+                self.root.after(0, self.finalize_load)
+
+            self.update_status_bar("Database loaded. Checking for updates...")
+            threading.Thread(target=update_and_finalize_task, daemon=True).start()
+            
+        threading.Thread(target=download_planet_images, args=(self.update_status_bar,), daemon=True).start()
+        threading.Thread(target=self._load_recipes_data, daemon=True).start()
+        self._load_mission_drop_data()
+
+
     def check_import_thread(self, thread):
         if thread.is_alive(): self.root.after(100, self.check_import_thread, thread)
         else: self.root.after(500, self.finalize_load)
@@ -2887,6 +3540,7 @@ class WarframeTrackerApp:
         self.full_item_name_map['/Lotus/Types/Items/MiscItems/Credits'] = "Credits"
         self.mastery_tracker_tab.display_items("Gesamtübersicht")
         self.root.after(200, self.update_all_summaries)
+        self.resource_tracker_tab.start_calculation()
         self.update_status_bar("Application loaded successfully.")
 
     def update_all_summaries(self): 
@@ -2895,24 +3549,129 @@ class WarframeTrackerApp:
             self.resource_tracker_tab.start_calculation()
 
 
+    def _calculate_intrinsics_xp(self):
+        """Calculates the total Mastery Points from all Intrinsics."""
+        try:
+            # --- KORREKTUR: Verwende self.conn direkt, um auf die Datenbank zuzugreifen ---
+            cursor = self.conn.cursor()
+            
+            cursor.execute("SELECT SUM(value) FROM user_progress")
+            total_ranks = cursor.fetchone()[0] or 0
+            return total_ranks * 1500 # Each rank is worth 1500 XP
+        except Exception as e:
+            # Gib einen Fehler aus, um zukünftiges Debugging zu erleichtern
+            print(f"Error calculating intrinsics XP: {e}")
+            return 0
+
+
+    def run_database_migrations(self):
+            """
+            Applies all necessary updates to an existing database to add new items and fix old ones.
+            """
+            self.update_status_bar("Checking for database updates...")
+
+            try:
+                cursor = self.conn.cursor()
+
+                # --- Fetch all items from API once ---
+                all_items_api_data = safe_get_json(
+                    "https://raw.githubusercontent.com/WFCD/warframe-items/refs/heads/master/data/json/All.json"
+                )
+                api_data_map = {item['uniqueName']: item for item in all_items_api_data if 'uniqueName' in item}
+
+                # --- MIGRATION 1: Insert missing new items ---
+                cursor.execute("SELECT uniqueName FROM items")
+                existing_unames = {row[0] for row in cursor.fetchall()}
+
+                items_to_insert = []
+                for item_data in all_items_api_data:
+                    unique_name = item_data.get('uniqueName')
+                    if not unique_name or unique_name in existing_unames:
+                        continue
+
+                    app_category = determine_app_category(item_data)
+                    if not app_category:
+                        continue
+                    if item_data.get('masterable') is False:
+                        continue
+                    if item_data.get('excludeFromCodex') is True:
+                        continue
+
+                    name = item_data.get('name')
+                    if not name:
+                        continue
+
+                    mr = item_data.get('masteryReq', 0)
+                    desc = item_data.get('description', '')
+                    image_name = item_data.get('imageName', '')
+                    build_price = item_data.get('buildPrice', 0)
+                    mastery_points = MASTERY_POINTS.get(app_category, 3000)
+                    components_json = json.dumps(item_data.get('components', []))
+
+                    items_to_insert.append((
+                        name, unique_name, app_category, mr, mastery_points,
+                        desc, image_name, components_json, build_price
+                    ))
+
+                if items_to_insert:
+                    self.update_status_bar(f"Adding {len(items_to_insert)} new items...")
+                    cursor.executemany("""
+                        INSERT OR IGNORE INTO items
+                        (name, uniqueName, category, mastery_rank, mastery_points,
+                         description, image_name, components, build_price)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, items_to_insert)
+                    self.conn.commit()
+
+                # --- MIGRATION 2: Fix wrong categories (Companion/Sentinel/Sentinel Weapon) ---
+                cursor.execute("SELECT uniqueName, category FROM items")
+                rows = cursor.fetchall()
+
+                updates = []
+                for unique_name, current_category in rows:
+                    item_data = api_data_map.get(unique_name)
+                    if not item_data:
+                        continue
+
+                    correct_category = determine_app_category(item_data)
+                    if not correct_category:
+                        continue
+
+                    if current_category != correct_category:
+                        correct_points = MASTERY_POINTS.get(correct_category, 3000)
+                        updates.append((correct_category, correct_points, unique_name))
+
+                if updates:
+                    cursor.executemany(
+                        "UPDATE items SET category = ?, mastery_points = ? WHERE uniqueName = ?",
+                        updates
+                    )
+                    self.conn.commit()
+                    self.update_status_bar(f"Recategorized {len(updates)} existing items.")
+
+                self.update_status_bar("Database migration complete.")
+
+            except Exception as e:
+                self.update_status_bar(f"Migration error: {e}")
+
+
+
     def calculate_total_xp(self):
             cursor = self.conn.cursor()
             
-            # 1. XP von Items
-            cursor.execute("SELECT SUM(mastery_points) FROM items WHERE status = 'Mastered'")
-            item_xp = cursor.fetchone()[0] or 0
+            # Führt die drei Abfragen in einem Rutsch aus
+            query = """
+            SELECT 
+                (SELECT COALESCE(SUM(mastery_points), 0) FROM items WHERE status = 'Mastered'),
+                (SELECT COALESCE(SUM(mastery_points), 0) FROM nodes WHERE status >= 1),
+                (SELECT COALESCE(SUM(steel_path_mastery_points), 0) FROM nodes WHERE status >= 2)
+            """
+            cursor.execute(query)
+            item_xp, normal_node_xp, steel_path_node_xp = cursor.fetchone()
             
-            # 2. XP von normalen Node-Abschlüssen
-            # (Jeder Node mit Status 1 ODER 2 zählt)
-            cursor.execute("SELECT SUM(mastery_points) FROM nodes WHERE status >= 1")
-            normal_node_xp = cursor.fetchone()[0] or 0
+            intrinsics_xp = self._calculate_intrinsics_xp()
             
-            # 3. XP von Steel Path Node-Abschlüssen
-            # (Nur Nodes mit Status 2 zählen)
-            cursor.execute("SELECT SUM(steel_path_mastery_points) FROM nodes WHERE status >= 2")
-            steel_path_node_xp = cursor.fetchone()[0] or 0
-            
-            return item_xp + normal_node_xp + steel_path_node_xp
+            return item_xp + normal_node_xp + steel_path_node_xp + intrinsics_xp
 
     def get_status_counts(self, category):
         cur = self.conn.cursor()
@@ -2945,11 +3704,27 @@ class WarframeTrackerApp:
             counts[status] = cnt or 0
         return counts
 
-    def update_status_bar(self, text): self.status_bar.config(text=text)
+
+    def update_status_bar(self, text):
+        self.status_bar.config(text=text)
+
     def on_closing(self):
+        """
+        Wird aufgerufen, wenn das Fenster geschlossen wird.
+        Sorgt für ein sauberes Herunterfahren.
+        """
+        # 1. Schließe die Datenbankverbindung, um Datenkorruption zu vermeiden.
         if self.conn:
-            self.conn.close()
-        self.root.destroy()
+            try:
+                self.conn.close()
+                print("Database connection closed.") # Optional: für Debugging
+            except Exception as e:
+                print(f"Error closing database: {e}")
+
+        # 2. Beende den gesamten Python-Prozess sofort.
+        # Dies ist notwendig, um alle laufenden (nicht-daemonischen) Download-Threads
+        # aus dem ThreadPoolExecutor zu beenden.
+        os._exit(0)
 
 
 if __name__ == "__main__":
