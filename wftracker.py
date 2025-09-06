@@ -689,32 +689,34 @@ def download_image_if_missing(url: str, local_path: str, headers=None, timeout=3
 
 def build_full_name_map(app, status_callback):
     """
-    Baut eine umfassende Übersetzungstabelle (uniqueName -> Name) aus mehreren API-Quellen.
+    Baut umfassende Übersetzungstabellen (uniqueName -> Name & Type) aus API-Quellen.
     """
-    status_callback("Building full item name cache...")
-    name_map = {
-        '/Lotus/Types/Items/MiscItems/Credits': "Credits" # Credits manuell hinzufügen
-    }
-    
-    # Liste der JSON-Dateien, die Namen enthalten könnten
+    status_callback("Building full item data cache...")
+    name_map = { '/Lotus/Types/Items/MiscItems/Credits': "Credits" }
+    type_map = { '/Lotus/Types/Items/MiscItems/Credits': "Currency" } # Typ für Credits
+
     urls_to_check = [
         "https://raw.githubusercontent.com/WFCD/warframe-items/refs/heads/master/data/json/All.json",
         "https://raw.githubusercontent.com/WFCD/warframe-items/refs/heads/master/data/json/Resources.json"
     ]
-    
+
     try:
         for url in urls_to_check:
-            data = safe_get_json(url) # Verwendet Ihre sichere JSON-Abruffunktion
+            data = safe_get_json(url)
             for item in data:
                 if 'uniqueName' in item and 'name' in item:
-                    # Füge den Namen zur Karte hinzu. Doppelte Einträge werden überschrieben, was ok ist.
-                    name_map[item['uniqueName']] = item['name']
-        
-        # Speichere die fertige Karte in der App-Instanz
+                    unique_name = item['uniqueName']
+                    name_map[unique_name] = item['name']
+                    # NEU: Befülle die Typen-Map. Nutze .get() für Sicherheit.
+                    type_map[unique_name] = item.get('type', 'N/A')
+
+        # Speichere beide fertigen Maps in der App-Instanz
         app.full_item_name_map = name_map
-        status_callback("Item name cache built successfully.")
+        app.item_type_map = type_map # <--- NEUE ZEILE
+        status_callback("Item data cache built successfully.")
     except Exception as e:
-        status_callback(f"Error building name cache: {e}")
+        status_callback(f"Error building data cache: {e}")
+
 
 
 # -------------------
@@ -2459,18 +2461,23 @@ class LiveTickerTab(ttk.Frame):
         self.trader_lbl = ttk.Label(trader_frame, text="Loading trader info...")
         self.trader_lbl.grid(row=0, column=0, sticky="w", pady=(0, 5))
 
-        tcols = ("item", "ducats", "credits")
+        tcols = ("item", "type", "ducats", "credits") # Spalte "type" hinzugefügt
         self.trader_tree = ttk.Treeview(trader_frame, columns=tcols, show="headings", height=6)
         self.trader_tree.heading("item", text="Item",
             command=lambda: self._treeview_sort_column(self.trader_tree, "item", False))
+        self.trader_tree.heading("type", text="Type", # Neuer Header
+            command=lambda: self._treeview_sort_column(self.trader_tree, "type", False))
         self.trader_tree.heading("ducats", text="Ducats",
             command=lambda: self._treeview_sort_column(self.trader_tree, "ducats", False))
         self.trader_tree.heading("credits", text="Credits",
             command=lambda: self._treeview_sort_column(self.trader_tree, "credits", False))
-        self.trader_tree.column("item", width=400, stretch=True)
+
+        self.trader_tree.column("item", width=300, stretch=True)
+        self.trader_tree.column("type", width=150, stretch=False) # Neue Spalten-Konfiguration
         self.trader_tree.column("ducats", width=100, anchor="center", stretch=False)
         self.trader_tree.column("credits", width=120, anchor="e", stretch=False)
         self.trader_tree.grid(row=1, column=0, sticky="nsew")
+
 
         trader_scroll = ttk.Scrollbar(trader_frame, orient="vertical", command=self.trader_tree.yview)
         self.trader_tree.configure(yscrollcommand=trader_scroll.set)
@@ -2695,21 +2702,50 @@ class LiveTickerTab(ttk.Frame):
                 self.trader_lbl.config(text=f"Baro Ki'Teer is at {data.get('Node', 'N/A')} and leaves in: {self.format_time((expiry - now).total_seconds())}")
                 for row in self.trader_tree.get_children(): self.trader_tree.delete(row)
                 for item in data.get("Manifest", []):
-                    name_parts = item.get("ItemType", "Unknown").split("/")
-                    name = name_parts[-1].replace("Prime", " Prime") if name_parts else "Unknown"
-                    self.trader_tree.insert("", "end", values=(name, item.get("PrimePrice", 0), f"{item.get('RegularPrice', 0):,}"))
+                    unique_name = item.get("ItemType", "Unknown")
+                    normalized_name = unique_name.replace("/StoreItems", "")
 
-        # Sortie (aus Haupt-API)
-        sortie_list = worldstate_data.get("Sorties")
-        if sortie_list and sortie_list[0]:
-            data = sortie_list[0]
-            expiry_ms = int(data['Expiry']['$date']['$numberLong'])
-            expiry = datetime.fromtimestamp(expiry_ms / 1000, tz=timezone.utc)
-            remaining = expiry - datetime.now(timezone.utc)
-            boss_name = data.get('Boss', 'N/A').replace('SORTIE_BOSS_', '').replace('_', ' ').title()
-            missions = "\n".join([f"- {pretty_mission_type(m.get('missionType'))} ({pretty_modifier(m.get('modifierType'))})" for m in data.get('Variants', [])])
-            self.sortie_title_lbl.config(text=f"Sortie: {boss_name}")
-            self.sortie_lbl.config(text=f"Time Remaining: {self.format_time(remaining.total_seconds())}\nMissions:\n{missions}")
+                    display_name = self.app.full_item_name_map.get(normalized_name, unique_name)
+                    # NEU: Hole den Typ aus der neuen Map
+                    item_type = self.app.item_type_map.get(normalized_name, "N/A")
+
+                    ducats = item.get("PrimePrice", 0)
+                    credits = f"{item.get('RegularPrice', 0):,}"
+
+                    # NEU: Füge item_type zum values-Tupel hinzu
+                    self.trader_tree.insert("", "end", values=(display_name, item_type, ducats, credits))
+
+
+        # --- Sortie (aus der API von warframestat.us) ---
+        sortie_data = worldstate_data.get("sortie")
+        if sortie_data and sortie_data.get('expiry'):
+            try:
+                # Zeitberechnung, genau wie bei Orb Vallis
+                expiry_str = sortie_data.get('expiry')
+                expiry_dt = datetime.fromisoformat(expiry_str.replace('Z', '+00:00'))
+                now_dt = datetime.now(timezone.utc)
+                remaining = expiry_dt - now_dt
+
+                # Daten auslesen (die neuen Keys sind einfacher)
+                boss_name = sortie_data.get('boss', 'N/A')
+                missions_list = sortie_data.get('variants', [])
+                
+                # Missions-Text zusammenbauen (die neuen Daten sind schon "pretty")
+                missions_text = "\n".join(
+                    f"- {m.get('missionType')} ({m.get('modifier')})" for m in missions_list
+                )
+
+                # UI-Elemente aktualisieren
+                self.sortie_title_lbl.config(text=f"Sortie: {boss_name}")
+                self.sortie_lbl.config(
+                    text=f"Time Remaining: {self.format_time(remaining.total_seconds())}\nMissions:\n{missions_text}"
+                )
+            except Exception as e:
+                print(f"Error processing Sortie data: {e}")
+                self.sortie_lbl.config(text="Error loading sortie data.")
+        else:
+            self.sortie_title_lbl.config(text="Sortie")
+            self.sortie_lbl.config(text="No active sortie.")
 
         # Archon Hunt (aus Haupt-API)
         archon_list = worldstate_data.get("LiteSorties")
@@ -3329,6 +3365,7 @@ class WarframeTrackerApp:
     def __init__(self, root):
             self.component_item_uniquenames = set()
             self.full_item_name_map = {}
+            self.item_type_map = {} 
             self.recipes_data = {}
             self.root = root
             self.root.title("Warframe Mastery Dashboard")
@@ -3380,7 +3417,7 @@ class WarframeTrackerApp:
             self.notebook.add(self.resource_tracker_tab, text=" Resource Tracker", image=self.icon_resources, compound=tk.LEFT)
             
             self.initial_load()
-            self.start_live_data_updater()
+            #self.start_live_data_updater()
             self.relic_finder_tab.load_all_relics_threaded()
             self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
@@ -3448,6 +3485,7 @@ class WarframeTrackerApp:
 
                 # --- Schritt 2: Lade die Zusatz-Daten ---
                 endpoints_to_merge = [
+                    'sortie',
                     'cetusCycle',
                     'vallisCycle',
                     'cambionCycle',
@@ -3644,6 +3682,7 @@ class WarframeTrackerApp:
         self.root.after(200, self.update_all_summaries)
         self.resource_tracker_tab.start_calculation()
         self.update_status_bar("Application loaded successfully.")
+        self.start_live_data_updater()
 
     def update_all_summaries(self): 
             self.dashboard_tab.update_display()
@@ -3783,7 +3822,6 @@ class WarframeTrackerApp:
             cur.execute("SELECT status, COUNT(*) FROM nodes GROUP BY status")
             rows = cur.fetchall()
             counts = {"Incomplete": 0, "Completed": 0, "Steel Path": 0}
-            # Falls du ein globales Mapping hast, kann man das auch nutzen:
             int_to_label = {0: "Incomplete", 1: "Completed", 2: "Steel Path"}
             for s, c in rows:
                 label = int_to_label.get(s)
@@ -3823,9 +3861,6 @@ class WarframeTrackerApp:
             except Exception as e:
                 print(f"Error closing database: {e}")
 
-        # 2. Beende den gesamten Python-Prozess sofort.
-        # Dies ist notwendig, um alle laufenden (nicht-daemonischen) Download-Threads
-        # aus dem ThreadPoolExecutor zu beenden.
         os._exit(0)
 
 
