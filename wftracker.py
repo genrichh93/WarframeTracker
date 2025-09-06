@@ -2382,26 +2382,32 @@ class LiveTickerTab(ttk.Frame):
         super().__init__(parent, padding=10)
         self.app = app
 
-        # Speichert pro Treeview die aktuelle Sortierung
         self.sort_states = {}
 
         # --- GRID KONFIGURATION ---
         self.columnconfigure(0, weight=1)
         self.columnconfigure(1, weight=1)
-        self.rowconfigure(1, weight=1)  # Missions/Nightwave soll sich vertikal ausdehnen
-
+        self.rowconfigure(1, weight=1)
+        
         # === BLOCK 1: ENVIRONMENTS (Obere Zeile) ===
         env_frame = ttk.LabelFrame(self, text="Environments", padding=10)
         env_frame.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 5))
         env_frame.columnconfigure((0, 1, 2), weight=1)
+        env_frame.columnconfigure((0, 1, 2, 3), weight=1)
+
 
         self.cetus_lbl = ttk.Label(env_frame, text="Cetus: loading...", justify="left")
         self.vallis_lbl = ttk.Label(env_frame, text="Orb Vallis: loading...", justify="left")
         self.cambion_lbl = ttk.Label(env_frame, text="Cambion Drift: loading...", justify="left")
+        self.duviri_lbl = ttk.Label(env_frame, text="Duviri: loading...", justify="left")
+        self.zariman_lbl = ttk.Label(env_frame, text="Zariman: loading...", justify="left")  # NEU
 
         self.cetus_lbl.grid(row=0, column=0, sticky="w")
         self.vallis_lbl.grid(row=0, column=1, sticky="w")
         self.cambion_lbl.grid(row=0, column=2, sticky="w")
+        self.duviri_lbl.grid(row=0, column=3, sticky="w") 
+        self.zariman_lbl.grid(row=0, column=4, sticky="w")  # NEU
+
 
         # === BLOCK 2: MISSIONS (Linke Spalte) ===
         missions_frame = ttk.LabelFrame(self, text="Missions", padding=10)
@@ -2536,12 +2542,15 @@ class LiveTickerTab(ttk.Frame):
 
     # --- Update der Inhalte ---
     def update_worldstate(self, worldstate_data):
-        # Environments
+        # --- CETUS ---
         cetus_data = worldstate_data.get('cetusCycle')
         if cetus_data:
-            self.cetus_lbl.config(text=f"Cetus: {'Day' if cetus_data.get('isDay') else 'Night'} (Ends in: {cetus_data.get('timeLeft', 'N/A')})")
+            self.cetus_lbl.config(
+                text=f"Cetus: {'Day' if cetus_data.get('isDay') else 'Night'} "
+                     f"(Ends in: {cetus_data.get('timeLeft', 'N/A')})"
+            )
 
-        # Orb Vallis
+        # --- ORB VALLIS ---
         vallis_data = worldstate_data.get('vallisCycle')
         if vallis_data:
             try:
@@ -2551,19 +2560,16 @@ class LiveTickerTab(ttk.Frame):
                 if expiry_str:
                     expiry_dt = datetime.fromisoformat(expiry_str.replace('Z', '+00:00'))
                     now_dt = datetime.now(timezone.utc)
-
                     remaining_seconds = (expiry_dt - now_dt).total_seconds()
 
-                    # Solange wir "in der Vergangenheit" sind, springe in den nächsten Zyklus
+                    # Ablauf überholen, wie bei Vallis-Zyklen nötig
                     while remaining_seconds <= 0:
                         if state_is_warm:
-                            # Warm → Cold (20 Minuten)
                             state_is_warm = False
-                            expiry_dt += timedelta(seconds=1200)
+                            expiry_dt += timedelta(seconds=1200)  # Warm → Cold
                         else:
-                            # Cold → Warm (6:40 Minuten)
                             state_is_warm = True
-                            expiry_dt += timedelta(seconds=400)
+                            expiry_dt += timedelta(seconds=400)   # Cold → Warm
                         remaining_seconds = (expiry_dt - now_dt).total_seconds()
 
                     time_left_str = self.format_time(remaining_seconds)
@@ -2577,13 +2583,100 @@ class LiveTickerTab(ttk.Frame):
             except Exception as e:
                 print(f"Error parsing Vallis time: {e}")
                 self.vallis_lbl.config(
-                    text=f"Orb Vallis: {'Warm' if vallis_data.get('isWarm') else 'Cold'} (Ends in: Error)")
+                    text=f"Orb Vallis: {'Warm' if vallis_data.get('isWarm') else 'Cold'} (Ends in: Error)"
+                )
 
-
+        # --- CAMBION ---
         cambion_data = worldstate_data.get('cambionCycle')
         if cambion_data:
             active_state = 'VOME' if cambion_data.get('isVome') else 'FASS'
-            self.cambion_lbl.config(text=f"Cambion: {active_state} (Ends in: {cambion_data.get('timeLeft', 'N/A')})")
+            self.cambion_lbl.config(
+                text=f"Cambion: {active_state} (Ends in: {cambion_data.get('timeLeft', 'N/A')})"
+            )
+
+        # --- DUVIRI ---
+        duviri_data = worldstate_data.get('duviriCycle')
+        if duviri_data:
+            try:
+                expiry_str = duviri_data.get('expiry')
+                activation_str = duviri_data.get('activation')
+
+                now_dt = datetime.now(timezone.utc)
+                act_dt = datetime.fromisoformat(activation_str.replace('Z', '+00:00')) if activation_str else None
+                exp_dt = datetime.fromisoformat(expiry_str.replace('Z', '+00:00')) if expiry_str else None
+
+                if exp_dt and act_dt:
+                    interval = (exp_dt - act_dt)
+                    if interval.total_seconds() <= 0:
+                        interval = timedelta(hours=2)  # fallback
+
+                    while (exp_dt - now_dt).total_seconds() <= 0:
+                        act_dt += interval
+                        exp_dt += interval
+
+                    remaining_seconds = (exp_dt - now_dt).total_seconds()
+                    time_left_str = self.format_time(remaining_seconds)
+                elif exp_dt:
+                    remaining_seconds = (exp_dt - now_dt).total_seconds()
+                    time_left_str = self.format_time(remaining_seconds)
+                else:
+                    time_left_str = "N/A"
+
+                # State bestimmen
+                state = duviri_data.get('state')
+                if not state:
+                    cycle_id = (duviri_data.get('id') or '').lower()
+                    if "joy" in cycle_id: state = "Joy"
+                    elif "anger" in cycle_id: state = "Anger"
+                    elif "sorrow" in cycle_id: state = "Sorrow"
+                    elif "envy" in cycle_id: state = "Envy"
+                    elif "fear" in cycle_id: state = "Fear"
+                    else: state = "Unknown"
+
+                self.duviri_lbl.config(text=f"Duviri: {state} (Ends in: {time_left_str})")
+            except Exception as e:
+                print(f"Error parsing Duviri time: {e}")
+                self.duviri_lbl.config(text="Duviri: Error")
+        else:
+            self.duviri_lbl.config(text="Duviri: N/A")
+            
+        # --- ZARIMAN ---
+        zariman_data = worldstate_data.get('zarimanCycle')
+        if zariman_data:
+            try:
+                expiry_str = zariman_data.get('expiry')
+                activation_str = zariman_data.get('activation')
+
+                now_dt = datetime.now(timezone.utc)
+                act_dt = datetime.fromisoformat(activation_str.replace('Z', '+00:00')) if activation_str else None
+                exp_dt = datetime.fromisoformat(expiry_str.replace('Z', '+00:00')) if expiry_str else None
+
+                if exp_dt and act_dt:
+                    interval = (exp_dt - act_dt)
+                    if interval.total_seconds() <= 0:
+                        interval = timedelta(hours=1)
+
+                    while (exp_dt - now_dt).total_seconds() <= 0:
+                        act_dt += interval
+                        exp_dt += interval
+
+                    remaining_seconds = (exp_dt - now_dt).total_seconds()
+                    time_left_str = self.format_time(remaining_seconds)
+                elif exp_dt:
+                    remaining_seconds = (exp_dt - now_dt).total_seconds()
+                    time_left_str = self.format_time(remaining_seconds)
+                else:
+                    time_left_str = "N/A"
+
+                # State kommt direkt aus der API (z.B. "grineer" / "corpus")
+                state = zariman_data.get('state', 'Unknown').title()
+
+                self.zariman_lbl.config(text=f"Zariman: {state} (Ends in: {time_left_str})")
+            except Exception as e:
+                print(f"Error parsing Zariman time: {e}")
+                self.zariman_lbl.config(text="Zariman: Error")
+        else:
+            self.zariman_lbl.config(text="Zariman: N/A")
 
         # Trader (aus Haupt-API)
         trader_list = worldstate_data.get("VoidTraders")
@@ -2657,6 +2750,7 @@ class LiveTickerTab(ttk.Frame):
 
         self.resort_tree(self.nightwave_tree)
         self.resort_tree(self.trader_tree)
+
 
 # --- NEUE RELIC FINDER KLASSE ---
 class RelicFinderTab(ttk.Frame):
@@ -3353,7 +3447,14 @@ class WarframeTrackerApp:
                 worldstate_data = safe_get_json(WORLDSTATE_URL, headers=headers)
 
                 # --- Schritt 2: Lade die Zusatz-Daten ---
-                endpoints_to_merge = ['cetusCycle', 'vallisCycle', 'cambionCycle', 'nightwave']
+                endpoints_to_merge = [
+                    'cetusCycle',
+                    'vallisCycle',
+                    'cambionCycle',
+                    'duviriCycle',
+                    'zarimanCycle',
+                    'nightwave'
+                ]
                 for endpoint in endpoints_to_merge:
                     try:
                         cycle_data = safe_get_json(f"{CYCLE_API_URL}/{endpoint}", headers=headers)
@@ -3369,6 +3470,7 @@ class WarframeTrackerApp:
                 self.update_status_bar(f"Error fetching live data: {e}")
 
             time.sleep(60)  # 1 minute refresh cycle
+
 
 
     def _load_mission_drop_data(self):
