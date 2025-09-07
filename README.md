@@ -58,29 +58,8 @@ Follow these steps to get the application running on your local machine.
 
 ### Installation
 
-1.  **Clone the repository:**
-    ```sh
-    git clone https://github.com/your-username/your-repo-name.git
-    cd your-repo-name
-    ```
+1.  **Download wftracker.py:**
 
-2.  **Create and activate a virtual environment (recommended):**
-    -   On Windows:
-        ```sh
-        python -m venv venv
-        .\venv\Scripts\activate
-        ```
-    -   On macOS/Linux:
-        ```sh
-        python3 -m venv venv
-        source venv/bin/activate
-        ```
-
-3.  **Install the required packages:**
-    A `requirements.txt` file is recommended. If you don't have one, you can install the packages directly:
-    ```sh
-    pip install requests sv-ttk matplotlib mplcursors Pillow
-    ```
 
 4.  **Run the application:**
     ```sh
@@ -106,9 +85,9 @@ On the very first launch, the application will detect an empty database. It will
 
 This application would not be possible without the amazing work of the Warframe community. All data is sourced from the following projects:
 
--   **[WFCD (Warframe Community Developers)](https://github.com/WFCD/warframe-items):** Provides the comprehensive `All.json` file for item data.
+-   **[WFCD (Warframe Community Developers)](https://github.com/WFCD/warframe-items/):** Provides the comprehensive `All.json` file for item data.
 -   **[warframestat.us](https://docs.warframestat.us/):** Provides the API for all live game state data (world cycles, sorties, traders, etc.).
--   **[Warframe Wiki](https://warframe.wiki.gg/):** The primary source for images and the target for all "Open in Wiki" actions.
+-   **[Warframe Wiki](https://wiki.warframe.com/):** The primary source for images and the target for all "Open in Wiki" actions.
 
 ## License
 
